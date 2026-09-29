@@ -11,6 +11,8 @@ import subprocess
 MANAGED_VERSION_REPOSITORIES = {
     "mdd-sim-gateway/control",
     "ghcr.io/mddidd/mdd-sim-gateway-engine",
+    "mdd-sim-gateway/relay",
+    "ghcr.io/mddidd/mdd-sim-gateway-relay",
 }
 MANAGED_LABEL = "io.mdd-sim-gateway.managed=true"
 VERSION_TAG = re.compile(r"v\d+(?:\.\d+)*(?:-[0-9A-Za-z.]+)?\Z")

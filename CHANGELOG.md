@@ -2,6 +2,262 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
+## [1.13.0] - 2026-09-29
+
+The automatic update channel stays on 1.9.5.
+
+### Upgrade notes
+
+- **Updating from v1.12.0 still needs about 6 GiB free.** That figure is checked by the updater
+  in the release being updated from; from 1.13.0 on, later updates ask only for what the
+  release's images need. On a small SD card, remove older images first (Settings, "Clear old
+  and rollback images").
+- **Behind a reverse proxy that rewrites `Host` -- nginx does by default -- live updates and
+  the softphone stop after this upgrade** until the proxy keeps the host name the browser used.
+  For nginx add `proxy_set_header Host $http_host;` to the gateway's `location` (not `$host`,
+  which drops a port other than 443 and is refused just the same); for any other proxy, either
+  keep `Host`, or list the proxy under Settings → Security → Trusted reverse proxies and have it
+  send `X-Forwarded-Host`. The WebUI shows a banner saying so when it happens. Direct
+  access and proxies that keep `Host` (Caddy, Traefik and Cloudflare do) need nothing.
+- **The control image gains one Python package**, `phonenumberslite`, which the address book
+  uses to tell two spellings of one number apart from two different numbers. It is the
+  pure-Python Apache-2.0 port of Google's libphonenumber without the geocoding and carrier data
+  (about 5 MB installed instead of 46 MB), with no dependencies and no native code. It comes
+  with the new control image; nothing needs installing on the host.
+- **The control plane gains two Python packages**, Pillow and pi-heif (the decode-only build of
+  pillow-heif), for converting MMS pictures on the gateway. The control image carries them; on
+  a host install `install.sh reload` installs them from prebuilt wheels (amd64 and arm64), and
+  a host that reloads offline needs them available first. A reload that cannot install
+  them, or that installs them but cannot import them, stops before anything is restarted
+  rather than coming up with picture conversion silently off.
+
+### Added
+
+- **Line offline and recovery notifications.** A line that stays offline longer than a
+  threshold (10 minutes by default, 1-1440 on the Notifications page) sends `line_offline` once,
+  with the reason, and `line_recovered` when it registers again. Lines switched off, drafts and
+  devices with VoWiFi off do not count; several lines crossing the threshold together make one
+  message. Before this a line could stay down for hours with no notice at all.
+- **The Quectel EC20 (`05c6:9215`) is recognised out of the box**, and built-in models now also
+  reach installations whose saved hardware list predates them (a saved entry for the same
+  vid/pid still wins). The container stack read hardware settings from the wrong place, so saved
+  models and names never applied there; it now reads `settings.hardware`.
+- **Experimental: add a modem the gateway does not know.** The Devices page lists unrecognised
+  USB devices that look like modems; "Try this device" finds the AT port and checks SIM access
+  with `AT+CSIM` before adding it, instead of editing `config.yaml` by hand.
+- **Messages are marked read.** A conversation with something new shows how many, and opening
+  it clears that. The position is recorded as a message id rather than a time, because an
+  inbound SMS carries the network's own timestamp and a delayed one can be older than a message
+  already read; ids follow arrival, which is what "new" means here. Messages shows the total on
+  its menu entry and can mark a whole line read. Everything already stored when this version is
+  installed counts as read, so an upgrade does not present years of history as unread.
+- **An address book.** Contacts can be added by hand or imported from a vCard (.vcf) or CSV
+  export, and exported in either format. Two spellings of one number are recognised as one by
+  reducing both to E.164 -- `+44 7700 900123`, `07700 900123` and `00447700900123` are the
+  same contact -- using the country of the SIM the number arrived on. With SIMs from several
+  countries, each line reads a nationally written book the way a phone holding that SIM would,
+  and a number is never matched through another line's country. A number that only means something where it was dialled, such as a short
+  code or a subscriber number with its area code left off, is deliberately left alone: local
+  `10000` is not one destination everywhere, and a SIM carries a country but never an area
+  code. Android's vCard 2.1 (quoted-printable names), iOS, iCloud and Google exports are read
+  as they are written. An import adds every entry as it is written and skips only an exact
+  copy of one already there, so importing an export twice does not double the book; a contact
+  that cannot be read is reported by name rather than dropped in silence. A CSV export is safe to open in a
+  spreadsheet.
+  Conversations, the call log and the incoming-call overlay show the name instead of the
+  number once it is known.
+- Optional relay media mode for call audio: a single built-in TURN relay container carries media
+  for every line instead of each engine publishing its own RTP ports. Switch with
+  `install.sh media relay|direct|status` on a host install, or
+  `python -m app.media relay|direct|status` inside the Control container on a full-container
+  deployment. The relay is the unmodified upstream `coturn/coturn:4.17.2-alpine`, pinned by
+  digest, shipped per architecture as a Release asset and mirrored to ghcr; it is fetched only
+  when relay mode is enabled. Direct mode (each line publishing its own ports) stays the default
+  and is unchanged. Relay mode needs nf_tables with its socket match in the host kernel. On a
+  full-container deployment it has been tested on Debian only, without a registered line, and
+  not on a Synology NAS.
+- Relay mode on older kernels (Synology DSM's 4.4), which have neither nf_tables nor its socket
+  match: the engines filter their media interface with iptables-legacy instead, IPv4 and IPv6.
+  nftables is still tried first, and a kernel that takes it runs exactly the rules it did
+  before; enabling checks the path that will actually be used and is refused, as before, only
+  when neither loads. Without the socket match the fallback can admit only the RTP port range,
+  so it does not tell the browser leg from the carrier leg: on an IPv4 PDN the carrier leg's
+  RTP is reachable through the relay, though only with valid TURN credentials, where direct
+  mode exposes the same ports with none. AMI, SIP and the WebSocket stay outside the range and
+  blocked. `python -m app.media status` and `/api/media` say which filter is in use and whether
+  it tells the two legs apart.
+- Client apps can sign in with the administrator's credentials and receive a long-lived bearer
+  token (`POST /api/auth/client/login`). A token is shown once and stored only as a digest,
+  expires after 90 days without use, and ends when the administrator revokes it
+  (`DELETE /api/auth/clients/{id}`) or changes the password. With it an app may use a line's
+  texts, MMS, calls, voicemail and softphone relay, the address book and read marks; every
+  other route is refused to it, and routes added later stay refused until they are listed in
+  `authz.py`. It sees each line's name, number and state -- wherever a line's status appears,
+  without the diagnostics -- and its live event socket carries only its lines' messages, calls,
+  voicemail and state, not host, hardware or engine events.
+
+### Changed
+
+- **MMS pictures are converted and shrunk on the gateway, not in the browser.** An attachment is
+  uploaded as soon as it is added; the gateway checks it, converts HEIC/HEIF, WebP, BMP and AVIF
+  to JPEG, and shares the line's size limit between the pictures, each re-encoded from its
+  original at the largest size (up to 1600 px) and then the highest quality that fits. The
+  composer shows each attachment's size before and after and the packaged total against the
+  limit. A picture phones show that already fits and is no larger than 1600 px keeps its
+  pixels; every picture sent loses its EXIF, XMP, IPTC or PNG text, so a photo no longer tells
+  the recipient where it was taken. The original is kept only while the
+  message is being written; the sent message stores what was sent. Clients using the API get
+  the same conversion when they send files directly, or can stage them with the new
+  `/mms/attachments` endpoints. Sound, video and animated GIFs are sent as they are (video
+  conversion can be added later as another converter).
+- Picture conversion is held to the memory the gateway has. Pictures are decoded in worker
+  processes, each shrunk to 1600 px as soon as it is decoded and kept that way while the
+  message is written, so editing the text re-encodes without decoding again. A decode starts
+  only when its cost, estimated from the header, fits the budget: several at once where there
+  is memory (up to `MDD_MMS_CONVERT_WORKERS`, default the CPUs), one after another where there
+  is not. A JPEG too large to decode whole within `MDD_MMS_CONVERT_MEMORY` (default: worked
+  out from the control container's `mem_limit`) is sent smaller and marked so in the composer;
+  a HEIC that large is refused with the reason. A worker that runs out of memory anyway is the
+  one the kernel stops, not the control plane. Uploads over 1 MB are spooled under the data
+  directory, not the container's 32 MB `/tmp`.
+- With several attachments the sender chooses between one MMS, whose attachments share the
+  line's per-MMS limit, and one MMS per attachment, each fitted to the whole limit (text and
+  subject go with the first; they are submitted in order).
+- MMS attachments are checked by content against one capability table (send / convert /
+  receive-only) that the MMS settings API returns as `formats`, with an `attachable` flag the
+  WebUI follows for its picker, paste and drag-drop. Unsupported codecs (such as HEVC video),
+  vCard 4.0 and files whose content does not match their declared kind are refused with the
+  reason when they are added.
+- A received part the browser cannot show is offered as a download marked "Preview not
+  available".
+- The engine image now includes nftables, which relay mode uses to filter each line's media
+  interface, and iptables-legacy, its fallback on kernels without nf_tables (about 0.3 MB; the
+  xtables extensions it uses already come with nftables). An update therefore rebuilds every
+  engine image.
+- **One `;user=phone` setting on the line form instead of two.** The call-only request-URI
+  parameters replace the old endpoint-wide checkbox, which also put `;user=phone` on SMS. The old
+  checkbox is shown only on a line where it was turned on by hand, labelled as the older setting,
+  so it can be turned off. O2 (234-10) keeps the endpoint-wide default its SMS has always used,
+  and its form now shows the call option on with `user=phone`.
+- **A long SMS completed by a late part says so, and is pushed again whole** (#193). A text
+  still missing parts after three minutes is shown and pushed with `[…]` for the gap; a part
+  that arrives later (up to an hour) completes it where it is. It keeps its place, its time and
+  its read state, and now carries a "Completed" mark with the time, stored with the message so
+  a reloaded page and a native client show it too. Once the last part is in, the whole text is
+  pushed once more, opening with "（补全）" so it reads as the rest of the first push rather
+  than a new message -- for anyone who reads only the push, the missing part may have been the
+  code they were waiting for.
+
+### Fixed
+
+- On the container stack, texts, calls and tunnel events from the lines never reached the WebUI
+  on an installation migrated from a host install: a saved `manager_url` pointing at the host
+  won over the container address, and the engines could not reach it. The container address
+  now wins there, and a delivery that fails is logged by the engine.
+- On the container stack, the browser softphone could not connect to a line going out directly
+  after it re-rendered its configuration: the softphone WebSocket was bound to the uplink
+  address. It is now bound on the Engine network (#195).
+- On a host install (local mode), switching on a country exit took the host's DNS: the exit's
+  tun interface registered itself as the default DNS route, so the host resolved nothing. The
+  exit interfaces are kept out of the host's DNS.
+- **Outgoing calls on T-Mobile US and MVNOs on its IMS core (310-240, such as Ultra Mobile).**
+  The network refused every call to a US number with 500 "CC_IMS_TRY_NEXT_MGCF_FAIL" because
+  the request URI lacked `;user=phone` (#114). A line can now add request-URI parameters to its
+  outgoing calls (line settings → SIP), and 310-240 lines add `user=phone` by default. Only the
+  call carries them; SMS is sent exactly as before, and every other carrier's lines are
+  unchanged unless the setting is switched on. Numbers are dialled as typed, `+` included.
+- **Every incoming SMS no longer ends in a failed SIP request.** Besides handing the text to the
+  manager, each engine forwarded it to the browser softphone as a SIP MESSAGE, which the
+  softphone has no handler for and answered with 405 Method Not Allowed. The WebUI shows texts
+  from the manager's store, so the forward is gone; nothing that was visible changes.
+- On the container stack, the browser softphone had no audio on a line behind a country exit.
+  Such a line is only on the internal Engine network, and Docker publishes no port there, so its
+  RTP ports were never reachable. Control now runs a small `mdd-sim-gateway-rtp-forward`
+  container from its own image that publishes those ranges and relays UDP to the line. The
+  Engine's networks and routes are unchanged, so nothing it sends can bypass the exit. A line
+  created before this version is forwarded once it is rebuilt (an update does that).
+- On the container stack, an EC25 on a host that gives network interfaces predictable names
+  (Debian 13 and other systemd 257 hosts call its data interface something like `wws27u1i4`
+  instead of `wwan0`) is claimed by ModemManager again. Hardware only told ModemManager about
+  interfaces named `wwan*`, so it never learned of the data port and refused the modem with
+  "Failed to find a net port in the QMI modem". Hardware now asks the kernel whether an
+  interface is a cellular one (`DEVTYPE=wwan`) instead of going by its name, reading each
+  interface once, and NetworkManager is allowed to manage `ww*` rather than only `wwan*`.
+- On the container stack, a modem ModemManager cannot claim is no longer reset every few
+  minutes for good. Each reset took that SIM's VoWiFi down for a minute or more. The resets now
+  double their spacing and stop after three, none is made while flight mode is on, and the count
+  starts over once ModemManager claims the modem.
+- In the installer's docker mode, `SWU_TUN_MTU` now reaches the control container, and a reload
+  or update keeps the value the running container had. Before, the container was recreated
+  without it, so the engines fell back to the default MTU and a carrier that drops fragments
+  never answered registration. `SWU_TUN_MTU=default ./install.sh reload` drops a carried-over
+  value, and a value outside 1280–1500 is ignored with a warning.
+- A modem that ModemManager put in state "failed" (seen as `unknown-capabilities` after
+  ModemManager restarted mid-probe) is no longer asked to enable every cycle and left marked
+  as starting. The orchestrator reboots the module when that can help, after a minute and at
+  most three times, spaced out, and not while flight mode is on, where the reboot would only
+  interrupt VoWiFi. The cellular badge says what happened, and VoWiFi, which
+  keeps working through the SIM bridge, is no longer shown as starting.
+- **A container update no longer asks for 6 GiB free.** The figure was fixed, sized for the
+  images before they were slimmed, and refused a Raspberry Pi with 5.1 GiB free for an update
+  whose arm64 archives total about 530 MB. It is now worked out from this release's archive
+  sizes -- staging must hold every archive, Docker's image store every archive and its
+  unpacked image -- with 4 GiB when the Release does not report sizes, and a refusal says how
+  much is needed and how much is free. The check runs in the release being updated from, so it
+  takes effect from the update after this one.
+- **A successful container update removes the releases before the one it replaced.** Only
+  the new release and its rollback are kept, besides anything a container uses and the host
+  install's `latest`/`trusted` images; before, every release's images stayed until someone
+  pruned them by hand.
+- **A line on a card reader follows its SIM to whichever reader holds it.** Switching the eSIM
+  in a reader to a profile last used in another reader started that profile's line with the
+  old USB port: the engine found no reader there, fell back to one holding another line's card,
+  refused to authenticate, and retried every minute until the line was saved again. Every
+  start now rebinds such a line to the reader the card monitor sees its SIM in, as modem lines
+  already were. No card is read to find it.
+
+### Security
+
+- WebSocket handshakes pass the same authentication as the API, in one middleware, so a socket
+  added later cannot be left open by forgetting a check. A socket signed in with the session
+  cookie must also come from the gateway's own page: its `Origin` has to match the host the
+  browser asked for, or the forwarded host from a trusted reverse proxy.
+- Signing out, changing the password or revoking a client app now also closes the event and
+  softphone sockets opened with that sign-in; before, they stayed connected until they dropped.
+- `install.sh reset-admin` now ends every sign-in made with the old account: browser sessions
+  and client app tokens stop working at once, and setting up a new administrator starts with
+  nobody signed in. Before, a session or token issued by the reset account kept working.
+- The administrative audit log records who acted: `admin`, `client:<id>`, `engine` or
+  `anonymous`.
+
+### Removed
+
+- The silent fallback for WebUI tabs older than the first public release, which kept a
+  signed-out event socket open instead of closing it with 4401.
+
+## [1.12.0] - 2026-09-26
+
+First release with the full-container deployment. The automatic update channel stays on 1.9.5.
+
+### Added
+
+- Full-container deployment on any Linux host with Docker Compose, including Synology NAS: three
+  base containers plus one Engine per line, one-click update with whole-stack rollback, amd64 and
+  arm64 images, a version-pinned Compose file, and a Synology DS1621+ driver pack. Validated on a
+  DS1621+ and a Raspberry Pi.
+- Modem VoLTE / IMS switch; detection of carriers without Wi-Fi Calling; cellular call audio
+  detection.
+
+### Changed
+
+- Separate 4G and VoWiFi badges in the device list; lower idle CPU on a Raspberry Pi.
+
+### Fixed
+
+- SIMs that grant a single logical channel; modems ModemManager gave up on; modem readers under an
+  unprivileged pcscd; MMS uploads cut short; Messages on a phone; a stale WebUI after an upgrade;
+  SIM fields missed on the first read.
+
 ## [1.11.0] - 2026-09-22
 
 ### Fixed

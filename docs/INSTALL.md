@@ -1,5 +1,8 @@
 # 安装与升级
 
+本文描述传统宿主辅助安装。Synology Container Manager 及其他全容器环境请使用
+[全容器部署指南](CONTAINER_DEPLOYMENT.md)，不要在 NAS 上执行本页的 `install.sh install`。
+
 ## 支持环境
 
 - 推荐 ARM64 Debian、Ubuntu 或 Armbian，systemd 可用。
@@ -54,7 +57,33 @@ Docker 的保守 dangling-only 清理；“清理旧版与回滚镜像”是显�
 
 安装完成后，在受信的局域网或 VPN 中立即打开 `https://主机地址:8443`，创建至少 10 字符的管理员密码。首次设置完成前，任何能访问该端口的客户端都可申领初始管理员。配置自有证书时，证书和私钥应只允许 root 读取。运行数据目录默认为 `0700`，凭据文件为 `0600`。
 
-浏览器电话与 WebUI 同源：信令走 `wss://主机地址:8443/api/instances/<线路>/softphone/ws`，由控制面经 Docker 网桥转发到对应线路的引擎，引擎不向主机发布信令端口，也不需要单独信任证书。放在反向代理之后时，只需让 WebUI 地址本身转发 WebSocket 升级（`Upgrade`/`Connection` 头），无需为软电话另开路径或端口。通话音频仍使用各线路的 RTP 端口。
+浏览器电话与 WebUI 同源：信令走 `wss://主机地址:8443/api/instances/<线路>/softphone/ws`，由控制面经 Docker 网桥转发到对应线路的引擎，引擎不向主机发布信令端口，也不需要单独信任证书。放在反向代理之后时，只需让 WebUI 地址本身转发 WebSocket 升级（`Upgrade`/`Connection` 头），无需为软电话另开路径或端口。控制面只接受来自自身页面的 WebSocket（`Origin` 必须与浏览器访问的主机一致）：代理保留 `Host` 头时无需任何设置；代理把 `Host` 改成内网地址时，需在设置里把代理地址填入"可信反向代理"，并由代理传递 `X-Forwarded-Host`。nginx 默认会改写 `Host`，在网关的 `location` 里加上下面几行即可：
+
+```nginx
+proxy_set_header Host $http_host;
+proxy_http_version 1.1;
+proxy_set_header Upgrade $http_upgrade;
+proxy_set_header Connection "upgrade";
+```
+
+用 `$http_host` 而不是 `$host`：`$host` 不带端口，代理监听 443 以外的端口时同样会被拒绝。
+
+不符合时，WebUI 顶部会出现"实时更新和软电话已停用"的提示，控制面日志记录 `refused WebSocket ... from origin`。通话音频默认仍使用各线路的 RTP 端口（direct 模式）。
+
+### 通话媒体模式
+
+通话音频有两种模式，可随时切换，切换会依次重建所有运行中的线路（各自重新注册）：
+
+```bash
+sudo ./install.sh media                                      # 查看当前模式
+sudo ./install.sh media direct                                # 默认：各线路发布自己的 RTP 端口
+sudo ./install.sh media relay [--port N] [--bind ADDR] \
+                               [--public-host HOST] [--public-port N]   # 经内置 TURN 中继
+```
+
+relay 模式下不再有任何引擎发布端口，改由一个 coturn 中继容器（`mdd-sim-gateway-relay`，未经修改的上游镜像 `coturn/coturn:4.17.2-alpine`，按摘要固定；正式发布包从 Release 附件导入，源码 checkout 或导入失败时依次从 ghcr 副本和 Docker Hub 拉取）发布单个端口（UDP+TCP，默认 8478），引擎只能通过内部媒体网络与它通信。启用前会先创建媒体网络、在临时引擎容器中确认内核支持所需的 nftables 规则，并等待中继应答 STUN 请求，任一步失败都会回滚且不修改当前模式，原因会打印出来。`--public-host`/`--public-port` 用于路由器/NAT 对外转发的主机名或端口与本机不同的情况；不指定时客户端使用访问 WebUI 时用的主机名和中继端口本身。
+
+启用 relay 后，需要在路由器/防火墙放行该中继端口的 UDP 和 TCP；如果部署在反向代理之后，代理通常只转发 HTTP(S)，中继端口需要单独做 TCP/UDP 直通或端口转发，不能走 HTTP 反代规则。中继不可达或未就绪时线路仍可注册和收发短信，只有浏览器通话会被拒绝或中途结束；切回 direct 会恢复各线路原有的端口分配。已验证的环境：Debian 13（内核 6.12），local 与 docker 两种模式。引擎防火墙优先使用内核的 nf_tables 及其 socket 匹配；较旧的内核（例如 4.4）改用 iptables-legacy，只按 RTP 端口范围放行，区分不了浏览器和运营商两条腿（`sudo ./install.sh media` 会显示用的是哪一种）；两者都不可用时启用会被拒绝。手动降级到不支持 relay 的版本前，先执行 `sudo ./install.sh media direct`，否则中继容器会留在原处。
 
 ## 更新
 

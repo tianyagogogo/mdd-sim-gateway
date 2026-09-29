@@ -89,6 +89,48 @@ export PIN_USIM_READER
 export SWU_SOURCE SWU_EPDG SWU_APN SWU_MCC SWU_MNC SWU_IMEI SWU_IMEISV SWU_CHILD_REKEY_MINUTES SWU_IDR_MODE SWU_CP_MODE SWU_CP_MODE_ORDER
 export SWU_ACCEPT_EPDG_ESP_REKEY
 
+# --- 1b. Relay media mode: the media interface accepts call media only ------------
+# The relay can reach this container's media address, and AMI, SIP and the softphone WebSocket
+# listen on every address. render.py wrote the ruleset that admits only UDP to the RTP range
+# there. If it cannot be loaded, the interface goes down instead: browser calls lose audio,
+# registration and SMS carry on, and nothing else is left reachable.
+# nftables comes first and, where the kernel takes it, is all that runs. A kernel without
+# nf_tables or its socket match (Synology DSM's 4.4) gets the iptables-legacy ruleset instead,
+# which admits the same port range but cannot tell the browser leg from the IMS leg (see
+# media_legacy_ruleset in render.py). IPv6 is filtered too unless the kernel has none at all.
+load_media_firewall() {
+  media_filter=""
+  if nft -f "$MDD_RUNDIR/media.nft"; then
+    media_filter=nft
+    return 0
+  fi
+  log "relay media: nftables ruleset refused by this kernel, trying iptables-legacy"
+  if ! iptables-legacy-restore < "$MDD_RUNDIR/media.iptables"; then
+    log "relay media: iptables-legacy (IPv4) failed too"
+    return 1
+  fi
+  if [ -e /proc/net/if_inet6 ] && ! ip6tables-legacy-restore < "$MDD_RUNDIR/media.iptables"; then
+    log "relay media: iptables-legacy (IPv6) failed"
+    return 1
+  fi
+  media_filter=iptables-legacy
+}
+
+if [ "${MDD_MEDIA_MODE:-direct}" = relay ]; then
+  media_filter=""
+  if [ -z "${MDD_MEDIA_IF:-}" ]; then
+    media_state=no_media_address
+  elif load_media_firewall; then
+    media_state=ready
+  else
+    ip link set dev "$MDD_MEDIA_IF" down || true
+    media_state=firewall_failed
+  fi
+  log "relay media: $media_state${media_filter:+ ($media_filter)}"
+  printf '{"mode": "relay", "state": "%s", "filter": "%s"}\n' "$media_state" "$media_filter" \
+    > "$MDD_RUNDIR/media.json"
+fi
+
 # --- 2. Start PIN keeper and wait for the SIM to be usable ------------------------
 # pin_keeper holds CHV1 verified for ami_usim's SIP IMS-AKA. swu_ike verifies the PIN itself
 # in its own connection for EAP-AKA, so both auth paths work on PIN-enabled SIMs.

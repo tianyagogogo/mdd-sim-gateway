@@ -105,7 +105,8 @@ def logical_channel_view(identity: dict | None, bridge_active: bool) -> dict:
         status, allocated, items = "stopped", 0, []
     error = str(identity.get("channel_error") or "")[:300]
     return {"capacity": capacity, "allocated": allocated, "status": status,
-            "items": items, "error": error}
+            "items": items, "error": error,
+            "shared": bool(identity.get("channel_shared")) and status == "ready"}
 
 
 def _read(path: str, default):

@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from control.app import config, operations, store
+from control.app import config, mms_staging, operations, store
 
 
 class _Store:
@@ -76,6 +76,21 @@ class MigrationBackupTests(unittest.TestCase):
 
 
 class LocalBackupTests(unittest.TestCase):
+    def test_release_archives_being_downloaded_by_the_updater_are_left_out(self):
+        with tempfile.TemporaryDirectory() as temp:
+            live = Path(temp, "live")
+            with _Store(live), patch.object(config, "DATA_DIR", str(live)):
+                Path(live, "config.yaml").write_text("settings: {}\ninstances: {}\n")
+                staging = Path(live, "update", "container-update.abc123")
+                staging.mkdir(parents=True)
+                Path(staging, "mdd-sim-gateway-engine-v9-arm64.tar.gz").write_bytes(b"x" * 4096)
+                Path(live, "update", "compose.previous.yaml").write_text("services: {}\n")
+                result = operations.create_local_backup("Test Gateway")
+                with tarfile.open(Path(store.backup_dir()) / result["name"]) as archive:
+                    names = archive.getnames()
+        self.assertIn("update/compose.previous.yaml", names)
+        self.assertFalse([n for n in names if n.startswith("update/container-update.")])
+
     def test_a_full_backup_holds_a_consistent_history_and_its_attachments(self):
         with tempfile.TemporaryDirectory() as temp:
             live = Path(temp, "live")
@@ -84,6 +99,7 @@ class LocalBackupTests(unittest.TestCase):
                 mid = add_mms()
                 stray = Path(store.mms_dir()) / str(mid) / "unreferenced.jpg"
                 stray.write_bytes(b"x")
+                draft = mms_staging.stage("1", "draft.jpg", "image/jpeg", b"draft")
                 result = operations.create_local_backup("Test Gateway")
                 archive_path = Path(store.backup_dir()) / result["name"]
                 self.assertFalse(list(Path(store.backup_dir()).glob(".staging-*")))
@@ -93,6 +109,7 @@ class LocalBackupTests(unittest.TestCase):
                 archive.extractall(restored, filter="data")
             self.assertIn("config.yaml", names)
             self.assertNotIn(f"mms/{mid}/unreferenced.jpg", names)
+            self.assertFalse([n for n in names if draft["id"] in n], "uploads being composed")
             self.assertEqual(read_back(restored, mid), [b"hi", b"\xff\xd8\xff-picture"])
 
     def test_a_live_attachment_omitted_from_the_snapshot_makes_the_backup_fail(self):

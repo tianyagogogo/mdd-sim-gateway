@@ -318,6 +318,16 @@ bearer.stats.tx-bytes : 456
         self.assertEqual(add[add.index("connection.autoconnect") + 1], "no")
         self.assertEqual(add[add.index("ipv4.never-default") + 1], "yes")
 
+    def test_the_first_dial_is_not_held_back_on_a_freshly_booted_host(self):
+        """The 45-second limit stored "never attempted" as monotonic zero, so on a host up
+        for less than 45 seconds the first dial was skipped."""
+        snapshot = {"powered": True, "data_active": False, "registration": "home",
+                    "primary_port": "ttyUSB5", "apn": "internet",
+                    "profile": Orchestrator.cellular_profile_name("modem-a")}
+        with patch("host.mdd_orchestrator.time.monotonic", return_value=5.0):
+            calls, _app = self._orchestrator_calls("ensure_modem_data", snapshot, exists=False)
+        self.assertTrue(any(call[:3] == ["nmcli", "connection", "up"] for call in calls))
+
     def test_an_existing_legacy_profile_is_corrected_even_without_an_apn(self):
         """Profiles written by an older version carry autoconnect=yes and no route guard, and
         they outlive the upgrade. Correcting them only when an APN was known left them."""
@@ -653,6 +663,37 @@ modem.3gpp.registration-state : unknown
             # pcsc-lite skips dot files, so the definition is only parked, not destroyed.
             self.assertIn("Virtual PCD", config.with_name(".vpcd.mdd-disabled").read_text())
             self.assertNotIn("0x8C7B", config.read_text())
+
+    def test_reader_definitions_stay_readable_by_an_unprivileged_pcscd(self):
+        """The service's UMask=0077 made the file 0600 root, which a pcscd that runs as
+        its own user (Ubuntu 26.04) skips — the host then shows no modem reader at all."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=False)
+            app.root.mkdir(parents=True)
+            modems = [{"id": "a", "name": "A", "tty": "/dev/a"}]
+            desired = {"a": {"vowifi_enabled": True}}
+            config = root / "readers.conf"
+            previous = os.umask(0o077)
+            try:
+                self.reconcile(app, modems, desired, config)
+            finally:
+                os.umask(previous)
+            self.assertEqual(config.stat().st_mode & 0o777, 0o644)
+
+            # A file an earlier release left at 0600 already holds the right content, so
+            # only its mode can prompt the repair — and pcscd must re-read it afterwards.
+            os.chmod(config, 0o600)
+            with patch("host.mdd_orchestrator.run",
+                       return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as run, \
+                    patch.object(app, "usb_modems", return_value=modems), \
+                    patch("host.mdd_orchestrator.subprocess.Popen",
+                          side_effect=lambda command, **kwargs: self.Process(command)), \
+                    patch.dict("os.environ", {"MDD_VPCD_READER_CONFIG": str(config)}):
+                app.reconcile_hardware({"hardware": {"auto_detect": True, "vpcd_slots": 3}},
+                                       desired)
+            self.assertEqual(config.stat().st_mode & 0o777, 0o644)
+            run.assert_any_call(["systemctl", "restart", "pcscd.service"])
 
     def test_a_port_saved_on_the_vpcd_default_is_migrated_away(self):
         with tempfile.TemporaryDirectory() as temp:

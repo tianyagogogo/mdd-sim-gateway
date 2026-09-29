@@ -24,6 +24,11 @@ This list covers the material dependencies intentionally used by MDD Sim Gateway
 | Tailwind CSS | Web interface styling | MIT | https://github.com/tailwindlabs/tailwindcss |
 | Twemoji Mozilla | Bundled color Emoji font used for country flags in proxy node names | Apache-2.0 (font tooling/code); Twemoji artwork CC-BY-4.0 | https://github.com/mozilla/twemoji-colr |
 | FastAPI | Control API framework | MIT | https://github.com/fastapi/fastapi |
+| Docker CLI 27.5.1 | Detached container-project update client | Apache-2.0 | https://github.com/docker/cli |
+| Docker Compose 2.32.4 | Transactional recreation of the Compose project during updates | Apache-2.0 | https://github.com/docker/compose |
+| phonenumberslite | Reducing two spellings of a phone number to E.164 so the address book can recognise a caller | Apache-2.0 (pure Python port of Google's libphonenumber, without its geocoding and carrier data; no bundled native code) | https://github.com/daviddrysdale/python-phonenumbers |
+| Pillow | Converting and shrinking MMS pictures on the gateway | MIT-CMU (binary wheels bundle libjpeg-turbo, libpng, libwebp, libavif and others under their own permissive licenses) | https://github.com/python-pillow/Pillow |
+| pi-heif | Reading HEIC/HEIF pictures for MMS conversion (the decode-only build of pillow-heif) | BSD-3-Clause (source); binary wheels bundle libheif and libde265 (LGPL-3.0), and no encoder | https://github.com/bigcat88/pillow_heif |
 | Android Open Source Project Carrier ID table | Offline MNO/MVNO identification data | Apache-2.0 | https://android.googlesource.com/platform/packages/providers/TelephonyProvider/ |
 
 Twemoji Mozilla is built by Mozilla from Twemoji artwork. The font project is Copyright

@@ -179,7 +179,7 @@ class CollectionTests(unittest.TestCase):
         client.df.return_value = report
         docker_module = SimpleNamespace(from_env=Mock(return_value=client))
         with patch.dict("sys.modules", {"docker": docker_module}):
-            value = sysinfo._docker_storage()
+            value = sysinfo._docker_storage(refresh=True)
         self.assertEqual(value["docker_images_bytes"], 100)
         self.assertEqual(value["docker_image_layers_bytes"], 700)
         self.assertEqual(value["docker_image_reclaimable_bytes"], 250)
@@ -206,10 +206,30 @@ class CollectionTests(unittest.TestCase):
         client.df.return_value = report
         docker_module = SimpleNamespace(from_env=Mock(return_value=client))
         with patch.dict("sys.modules", {"docker": docker_module}):
-            value = sysinfo._docker_storage()
+            value = sysinfo._docker_storage(refresh=True)
         self.assertTrue(value["docker_images_all_managed"])
         self.assertEqual(value["mdd_old_image_count"], 1)
         self.assertEqual(value["mdd_old_images_reclaimable_bytes"], 50)
+
+    def test_docker_storage_reuses_cache_between_host_health_samples(self):
+        report = {"Images": [], "Containers": [], "ImageUsage": {}, "BuildCache": []}
+        client = Mock()
+        client.df.return_value = report
+        docker_module = SimpleNamespace(from_env=Mock(return_value=client))
+        with patch.dict("sys.modules", {"docker": docker_module}), \
+                patch.object(sysinfo, "_docker_storage_cache", {}), \
+                patch.object(sysinfo, "_docker_storage_cached_at", 0.0):
+            first = sysinfo._docker_storage()
+            second = sysinfo._docker_storage()
+        self.assertEqual(first, second)
+        client.df.assert_called_once_with()
+
+    def test_health_collection_can_skip_expensive_docker_storage_scan(self):
+        with patch.object(sysinfo, "_project_paths", return_value=[]), \
+                patch.object(sysinfo, "_docker_storage") as docker_storage:
+            value = sysinfo.project_storage("/data", include_docker_storage=False)
+        self.assertEqual(value["files_bytes"], 0)
+        docker_storage.assert_not_called()
 
     def test_absent_platform_fields_are_omitted_rather_than_faked(self):
         with patch.object(sysinfo, "_vcgencmd", return_value=""), \

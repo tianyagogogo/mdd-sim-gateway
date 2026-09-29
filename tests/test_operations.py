@@ -742,6 +742,87 @@ class ServiceRestartTests(unittest.TestCase):
     def test_no_request_and_no_history_reads_as_idle(self):
         self.assertEqual(operations.service_restart_status()["state"], "idle")
 
+    def test_a_container_restart_that_never_completes_is_reported_failed(self):
+        self.root.mkdir(parents=True)
+        (self.root / "service-restart-status.json").write_text(json.dumps({
+            "state": "running", "scope": "control", "executor": "container",
+            "updated_at": int(time.time()) - 300}))
+        status = operations.service_restart_status()
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["error_code"], "restart.error.failed")
+
+    def test_container_mode_rejects_host_reboot_without_publishing_a_request(self):
+        with patch.dict(os.environ, {"MDD_CONTAINER_STACK": "1"}):
+            result = operations.request_service_restart("host")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "restart.error.host_unavailable")
+        self.assertFalse((self.root / "service-restart-request.json").exists())
+
+    def test_container_service_restart_checks_ownership_and_orders_base_services_first(self):
+        restarted = []
+
+        class Container:
+            def __init__(self, component):
+                self.attrs = {"Config": {"Labels": {
+                    "io.mdd-sim-gateway.managed": "true",
+                    "io.mdd-sim-gateway.component": component}}}
+                self.component = component
+                self.image = Mock(id=f"sha256:{component}")
+            def restart(self, timeout):
+                self.assert_timeout = timeout
+                restarted.append(self.component)
+
+        containers = {name: Container(component) for component, name in {
+            "control": "mdd-sim-gateway-control",
+            "hardware": "mdd-sim-gateway-hardware",
+            "egress": "mdd-sim-gateway-egress"}.items()}
+        client = Mock()
+        client.containers.get.side_effect = containers.__getitem__
+        with patch.dict(os.environ, {"MDD_CONTAINER_STACK": "1"}):
+            operations.request_service_restart("services")
+            result = operations.perform_container_service_restart("services", client)
+
+        self.assertEqual(result["state"], "running")
+        self.assertEqual(restarted, ["egress", "hardware"])
+        client.containers.run.assert_called_once()
+        helper = client.containers.run.call_args
+        self.assertEqual(helper.args[0], "sha256:control")
+        self.assertEqual(helper.kwargs["network_mode"], "none")
+        self.assertEqual(helper.kwargs["healthcheck"], {"test": ["NONE"]})
+        self.assertEqual(len(helper.kwargs["command"]), 1)
+        self.assertIn("mdd-sim-gateway-control", helper.kwargs["command"][0])
+        self.assertIn("target.restart(timeout=30)", helper.kwargs["command"][0])
+        self.assertTrue((self.root / "pcsc-maintenance").is_file())
+        self.assertFalse((self.root / "service-restart-request.json").exists())
+
+    def test_container_restart_refuses_a_foreign_named_container(self):
+        foreign = Mock()
+        foreign.attrs = {"Config": {"Labels": {}}}
+        client = Mock()
+        client.containers.get.return_value = foreign
+        operations.request_service_restart("control")
+        result = operations.perform_container_service_restart("control", client)
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("unowned", result["error"])
+        foreign.restart.assert_not_called()
+
+    def test_container_restart_reports_an_unavailable_docker_daemon(self):
+        operations.request_service_restart("control")
+        with patch.object(operations.docker, "from_env",
+                          side_effect=RuntimeError("daemon unavailable")):
+            result = operations.perform_container_service_restart("control")
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error_code"], "restart.error.failed")
+        self.assertIn("daemon unavailable", result["error"])
+
+    def test_returning_control_process_settles_container_restart(self):
+        status_path = self.root / "service-restart-status.json"
+        self.root.mkdir(parents=True)
+        status_path.write_text(json.dumps({
+            "state": "running", "scope": "control", "executor": "container"}))
+        status = operations.settle_container_service_restart()
+        self.assertEqual(status["state"], "success")
+
 
 if __name__ == "__main__":
     unittest.main()

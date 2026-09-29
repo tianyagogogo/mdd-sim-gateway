@@ -6,11 +6,13 @@ import Messages from './views/Messages.jsx'
 import Esim from './views/Esim.jsx'
 import Keepalive from './views/Keepalive.jsx'
 import { UnifiedOverview, DevicesPage, EgressPage, NotificationsPage, SystemPage, DiagnosticsPage } from './views/UnifiedPages.jsx'
+import ContactsPage from './views/Contacts.jsx'
 import { useI18n } from './i18n.jsx'
 
 const NAV = [
   ['overview', 'Overview', '⌂'], ['devices', 'Devices', '▣'], ['calls', 'Calls', '☎'],
-  ['messages', 'Messages', '✉'], ['esim', 'eSIM', '◎'], ['keepalive', 'Balance & keeping', '◷'],
+  ['messages', 'Messages', '✉'], ['contacts', 'Contacts', '☏'],
+  ['esim', 'eSIM', '◎'], ['keepalive', 'Balance & keeping', '◷'],
   ['egress', 'Network exits', '⇄'],
   ['notifications', 'Notifications', '◉'], ['settings', 'System settings', '⚙'], ['diagnostics', 'Diagnostics', '≣'],
 ]
@@ -114,8 +116,13 @@ export default function App() {
   const [loadErrors, setLoadErrors] = useState({})
   const [selected, setSelected] = useState(null); const [toast, setToast] = useState(null)
   const [selectedDeviceId, setSelectedDeviceId] = useState(null)
+  const [deviceTab, setDeviceTab] = useState(null)
   const [theme, setTheme] = useState(() => localStorage.getItem('theme') || 'auto')
   const [systemMeta, setSystemMeta] = useState({ version: '', repository_url: '' })
+  // Unread messages across every line, for the badge on Messages. The page itself keeps the
+  // per-conversation counts; this is refreshed when a message arrives and when one is read.
+  const [unreadTotal, setUnreadTotal] = useState(0)
+  const loadUnread = useCallback(() => api.unreadTotal().then(r => setUnreadTotal(Number(r.total) || 0)).catch(() => {}), [])
   const [updateOpen, setUpdateOpen] = useState(false)
   const [authState, setAuthState] = useState(null)
   const wsEvents = useRef({ handlers: new Set() }); const toastTimer = useRef(null); const unifiedAvailable = useRef(false)
@@ -197,6 +204,32 @@ export default function App() {
     else if(s.state==='success'&&age<900)showToast(t('Updated to v{version}',{version:s.target||''}))
   }).catch(()=>{})},[authState?.authenticated,showToast,t])
   useEffect(()=>{ if(!authState?.authenticated)return; const timer=setInterval(refresh,10000); return()=>clearInterval(timer) },[refresh,authState?.authenticated])
+  // A container update replaces Control part-way through and may still roll everything back
+  // afterwards. Watching only at sign-in showed the new version number with no hint that the
+  // update was still running, so a rollback drill that ended on the old version looked like a
+  // successful upgrade. Keep a banner up while it runs and report the outcome when it lands.
+  const [updateRun, setUpdateRun] = useState(null)
+  // The event socket was refused for the page's origin: live updates and the softphone are off
+  // until the reverse proxy is fixed, so this stays up rather than being a passing toast.
+  const [originRefused, setOriginRefused] = useState(false)
+  const lastUpdateState = useRef(null)
+  useEffect(()=>{
+    if(!authState?.authenticated)return
+    let stop=false
+    const poll=()=>api.updateProgress().then(s=>{
+      if(stop)return
+      const running=s.state==='running'&&!s.stale
+      setUpdateRun(running?s:null)
+      if(lastUpdateState.current==='running'&&!running){
+        if(s.state==='success')showToast(t('Updated to v{version}',{version:s.target||''}))
+        else if(s.state==='failed')showToast(t(s.rollback_succeeded?'Update failed and the previous version was restored: {error}':'Update failed: {error}',{error:String(s.error||'').split('\n')[0].slice(0,160)}))
+      }
+      lastUpdateState.current=running?'running':s.state
+    }).catch(()=>{})
+    poll(); const timer=setInterval(poll,5000)
+    return()=>{stop=true;clearInterval(timer)}
+  },[authState?.authenticated,showToast,t])
+  useEffect(()=>{ if(authState?.authenticated) loadUnread() },[authState?.authenticated,loadUnread])
 
   useEffect(()=>{ if(!authState?.authenticated)return; return connectWs(msg=>{
     if(msg.type==='status'){
@@ -213,32 +246,35 @@ export default function App() {
       showToast({card_removed:t('SIM removed — line stopped'),reader_lost:t('Reader unplugged — line stopped'),reader_added:`${t('Card reader connected')}${name?`: ${name}`:''}`,reader_removed:`${t('Card reader disconnected')}${name?`: ${name}`:''}`}[msg.event])
     }
     if(['device','capability','cellular','engine'].includes(msg.type)) refresh()
+    if(msg.type==='sms') loadUnread()
     wsEvents.current.handlers.forEach(h=>h(msg))
     if(msg.type==='sms'&&msg.message?.direction==='in')showToast(t('SMS from {peer}',{peer:msg.message.peer}))
     if(msg.type==='call'&&msg.call?.direction==='in')showToast(t('Incoming call from {peer}',{peer:msg.call.peer}))
-  },expireAuth)},[refresh,showToast,t,authState?.authenticated,expireAuth])
+  },expireAuth,()=>setOriginRefused(true))},[refresh,showToast,t,authState?.authenticated,expireAuth,loadUnread])
   const subscribe=useCallback(h=>{wsEvents.current.handlers.add(h);return()=>wsEvents.current.handlers.delete(h)},[])
   if (!authState) return <div className="auth-shell"><div className="auth-card"><h1>MDD Sim Gateway</h1><p>{t('Loading…')}</p></div></div>
   if (!authState.authenticated) return <AuthScreen configured={authState.configured} accountUsername={authState.username} t={t} onDone={result=>{setCsrf(result.csrf);setAuthState(s=>({...s,configured:true,authenticated:true,csrf:result.csrf}))}} />
   const sel=instances.find(i=>i.id===selected)
-  const common={devices,discovering,initialLoading,loadErrors,refreshDevices:refresh,instances,cards,selected:sel,setSelected,refresh,subscribe,showToast,setView,selectedDeviceId,setSelectedDeviceId,openUpdateDialog,setSystemMeta}
+  const common={devices,discovering,initialLoading,loadErrors,refreshDevices:refresh,instances,cards,selected:sel,setSelected,refresh,subscribe,showToast,setView,selectedDeviceId,setSelectedDeviceId,deviceTab,setDeviceTab,openUpdateDialog,setSystemMeta,refreshUnread:loadUnread}
   const content={
     overview:<UnifiedOverview {...common}/>, devices:<DevicesPage {...common}/>, calls:<Softphone {...common}/>,
     messages:<Messages {...common}/>, esim:<Esim {...common}/>, keepalive:<Keepalive {...common}/>,
     egress:<EgressPage {...common}/>,
-    notifications:<NotificationsPage {...common}/>, settings:<SystemPage {...common}/>, diagnostics:<DiagnosticsPage {...common}/>,
+    notifications:<NotificationsPage {...common}/>,
+    contacts:<ContactsPage showToast={showToast}/>,
+    settings:<SystemPage {...common}/>, diagnostics:<DiagnosticsPage {...common}/>,
   }[view]
   const issueUrl = `${(systemMeta.repository_url || 'https://github.com/MddIdd/mdd-sim-gateway').replace(/\/$/, '')}/issues/new/choose`
   return <div className="u-shell">
     <GlobalSoftphone instances={instances} excludedId={view === 'calls' ? sel?.id : null} showToast={showToast} />
     <aside className={`u-sidebar ${menuOpen?'open':''}`}>
       <div className="u-brand"><img src="/logo.svg" alt="" /><div>MDD Sim Gateway<small>{t('4G + VoWiFi unified')}</small></div></div>
-      <nav>{NAV.map(([key,label,icon])=><button key={key} className={view===key?'active':''} onClick={()=>{setView(key);setMenuOpen(false)}}><span>{icon}</span>{t(label)}{key==='diagnostics'&&!!systemMeta.host_alerts?.length&&<i className={`u-nav-dot ${systemMeta.host_alerts.some(a=>a.severity==='critical')?'critical':'warning'}`} title={t('The gateway host needs attention')}/>}{key==='calls'&&!!systemMeta.unheard_voicemails&&<i className="u-nav-dot critical" title={t('There are voicemails you have not played')}/>}</button>)}</nav>
+      <nav>{NAV.map(([key,label,icon])=><button key={key} className={view===key?'active':''} onClick={()=>{setView(key);setMenuOpen(false)}}><span>{icon}</span>{t(label)}{key==='diagnostics'&&!!systemMeta.host_alerts?.length&&<i className={`u-nav-dot ${systemMeta.host_alerts.some(a=>a.severity==='critical')?'critical':'warning'}`} title={t('The gateway host needs attention')}/>}{key==='calls'&&!!systemMeta.unheard_voicemails&&<i className="u-nav-dot critical" title={t('There are voicemails you have not played')}/>}{key==='messages'&&unreadTotal>0&&<span className="u-nav-count" aria-label={t('{count} unread',{count:unreadTotal})}>{unreadTotal>99?'99+':unreadTotal}</span>}</button>)}</nav>
       <div className="u-sidebar-foot"><div className="u-theme">{[['auto','◐'],['light','☀'],['dark','☾']].map(([k,x])=><button key={k} className={theme===k?'active':''} onClick={()=>setTheme(k)} title={t(k)}>{x}</button>)}</div><small>{discovering&&!devices.length?t('Detecting devices…'):`${devices.length} ${t(devices.length === 1 ? 'device' : 'devices')}`}</small><a className="u-feedback-link" href={issueUrl} target="_blank" rel="noreferrer"><span>◉</span>{t('Issues and suggestions')}<b>↗</b></a><div className="u-project-meta">{systemMeta.update?.update_available&&systemMeta.update?.release_url?<a className="u-version has-update" href={systemMeta.update.release_url} onClick={e=>{e.preventDefault();setUpdateOpen(true)}} title={t('New version available: v{version}',{version:systemMeta.update.latest})}><i />v{systemMeta.version}</a>:<span className="u-version">{systemMeta.version ? `v${systemMeta.version}` : '—'}</span>}<span className="u-repo-actions">{systemMeta.repository_url&&<><a href={systemMeta.repository_url} target="_blank" rel="noreferrer" aria-label="GitHub" title="GitHub"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .7a11.5 11.5 0 0 0-3.64 22.4c.58.1.79-.25.79-.56v-2.23c-3.22.7-3.9-1.37-3.9-1.37-.52-1.34-1.29-1.69-1.29-1.69-1.05-.72.08-.71.08-.71 1.17.08 1.78 1.2 1.78 1.2 1.04 1.78 2.72 1.27 3.38.97.1-.75.4-1.27.74-1.56-2.57-.29-5.27-1.29-5.27-5.69 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.47.11-3.06 0 0 .97-.31 3.16 1.18a10.9 10.9 0 0 1 5.75 0c2.19-1.49 3.16-1.18 3.16-1.18.63 1.59.23 2.77.11 3.06.74.81 1.19 1.84 1.19 3.1 0 4.42-2.71 5.39-5.29 5.68.42.36.79 1.07.79 2.16v3.2c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .7Z"/></svg></a><a className="u-star-link" href={systemMeta.repository_url} target="_blank" rel="noreferrer" aria-label={t('Star on GitHub')} title={t('Star on GitHub')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2.7 2.75 5.58 6.16.9-4.46 4.34 1.05 6.13L12 16.76l-5.5 2.89 1.05-6.13-4.46-4.34 6.16-.9L12 2.7Z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round"/></svg><b>{starCount(systemMeta.update?.stars) || '—'}</b></a></>}</span></div><button className="btn btn-ghost" onClick={async()=>{try{await api.authLogout()}finally{setCsrf('');setAuthState(s=>({...s,configured:true,authenticated:false,csrf:''}))}}}>{t('Sign out')}</button></div>
     </aside>
     <button className="u-menu" onClick={()=>setMenuOpen(!menuOpen)}>☰</button>
     {menuOpen&&<button className="u-scrim" aria-label={t('Close menu')} onClick={()=>setMenuOpen(false)}/>}
-    <main className="u-main"><header><div><h1>{t(NAV.find(x=>x[0]===view)?.[1]||view)}</h1><p>{t(`page.${view}.subtitle`)}</p></div><div className="u-live"><span className="u-dot" />{initialLoading?t('Loading…'):loadErrors.devices?t('Loading failed'):unifiedAvailable.current?t('Live device control'):t('Compatibility view')}</div></header><div className="u-content"><div className="u-note" role="note">{t('Responsible use notice')}</div>{content}</div></main>
+    <main className="u-main"><header><div><h1>{t(NAV.find(x=>x[0]===view)?.[1]||view)}</h1><p>{t(`page.${view}.subtitle`)}</p></div><div className="u-live"><span className="u-dot" />{initialLoading?t('Loading…'):loadErrors.devices?t('Loading failed'):unifiedAvailable.current?t('Live device control'):t('Compatibility view')}</div></header><div className="u-content">{originRefused&&<div className="u-update-banner rollback" role="alert"><b>{t('Live updates and the softphone are off: the gateway does not recognise the address this page was opened from.')}</b><span>{t('A reverse proxy in front of the gateway must keep the Host header (nginx: proxy_set_header Host $http_host;), or be listed under Settings → Security → Trusted reverse proxies and send X-Forwarded-Host.')}</span></div>}{updateRun&&<div className={`u-update-banner ${updateRun.phase==='rollback'?'rollback':''}`} role="status"><b>{updateRun.phase==='rollback'?t('The update to v{version} failed; restoring the previous version…',{version:updateRun.target||''}):t('Updating to v{version}: {step}',{version:updateRun.target||'',step:t(UPDATE_PHASES[normalizedUpdatePhase(updateRun.phase)]||UPDATE_PHASES.requested)})}</b><span>{t('Until the update finishes, the version shown may change and lines may briefly reconnect.')}</span></div>}<div className="u-note" role="note">{t('Responsible use notice')}</div>{content}</div></main>
     {toast&&<div className="u-toast" key={toast.id} role="status">{toast.message}</div>}
     {updateOpen&&systemMeta.update?.update_available&&<UpdateModal update={systemMeta.update} current={systemMeta.version} t={t} onClose={()=>setUpdateOpen(false)}/>}
   </div>
@@ -248,11 +284,15 @@ const UPDATE_PHASES = {
   requested: 'Contacting the host…', launching: 'Contacting the host…',
   downloading: 'Downloading the new release…', verifying: 'Verifying the package…',
   engine_image: 'Importing the verified Engine image…',
+  hardware_image: 'Importing the verified Hardware image…',
+  egress_image: 'Importing the verified Egress image…',
   backup: 'Backing up the current version…', applying: 'Applying files…',
   control_image: 'Importing the verified control image…',
   reloading: 'Rebuilding and restarting services…',
+  engine_rollout: 'Restarting lines with the new Engine image…',
+  rollback: 'Restoring the previous container version…',
 }
-const UPDATE_PHASE_ORDER = ['requested', 'downloading', 'verifying', 'engine_image', 'control_image', 'backup', 'applying', 'reloading', 'done']
+const UPDATE_PHASE_ORDER = ['requested', 'downloading', 'verifying', 'control_image', 'hardware_image', 'egress_image', 'engine_image', 'backup', 'applying', 'reloading', 'engine_rollout', 'done']
 const normalizedUpdatePhase = phase => phase === 'launching' ? 'requested' : (phase || 'requested')
 const formatUpdateBytes = value => {
   const bytes = Math.max(0, Number(value) || 0)
@@ -347,14 +387,15 @@ function UpdateModal({ update, current, t, onClose }) {
   }
   const mute = { fontSize: 12, color: 'var(--text-mute)' }
   const visiblePhases = UPDATE_PHASE_ORDER.filter(key =>
-    (key !== 'control_image' || progress?.install_mode === 'docker') &&
+    (key !== 'control_image' || ['docker', 'container'].includes(progress?.install_mode)) &&
+    (!['hardware_image', 'egress_image', 'engine_rollout'].includes(key) || progress?.install_mode === 'container') &&
     (key !== 'engine_image' || progress?.engine_image_required))
   const activePhase = normalizedUpdatePhase(phase)
   const activeIndex = Math.max(0, visiblePhases.indexOf(activePhase))
   const downloaded = Number(progress?.downloaded_bytes) || 0
   const total = Number(progress?.total_bytes) || 0
   const percent = total > 0 ? Math.min(100, Math.round(downloaded * 100 / total)) : 0
-  const transferring = ['downloading', 'engine_image', 'control_image'].includes(activePhase)
+  const transferring = ['downloading', 'engine_image', 'control_image', 'hardware_image', 'egress_image'].includes(activePhase)
   const speed = Number(progress?.bytes_per_second) || 0
   // Only an estimate the host can actually support: a Release whose size the check never
   // returned, or a transfer that has not moved yet, gets no countdown rather than a wrong one.
@@ -390,7 +431,7 @@ function UpdateModal({ update, current, t, onClose }) {
             {mode === 'restarting' ? t('The gateway is restarting — the page will reload automatically. Sign in again afterwards.') : t(UPDATE_PHASES[phase] || UPDATE_PHASES.requested)}
           </p>
           <div className="u-update-facts">
-            <div><span>{t('Installation mode')}</span><b>{progress?.install_mode === 'docker' ? t('Docker container') : progress?.install_mode === 'local' ? t('Local service') : '—'}</b></div>
+            <div><span>{t('Installation mode')}</span><b>{progress?.install_mode === 'container' ? t('Full container project') : progress?.install_mode === 'docker' ? t('Docker container') : progress?.install_mode === 'local' ? t('Local service') : '—'}</b></div>
             <div><span>{t('Download route')}</span><b title={progress?.route ? routeDetail : ''}>{progress?.route ? routeDetail : '—'}</b></div>
             <div><span>{t('Elapsed time')}</span><b>{formatUpdateDuration(elapsed, t)}</b></div>
           </div>

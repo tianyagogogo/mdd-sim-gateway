@@ -2,8 +2,6 @@
 {% if webrtc_enable %}{% set _ = local_eps.append('PJSIP/' ~ webrtc_user) %}{% endif %}
 {% set dialstr = local_eps | join('&') %}
 {% set inbound_ring_seconds = vm_ring_seconds if vm_enabled else 60 %}
-{% set msg_targets = [] %}
-{% if webrtc_enable %}{% set _ = msg_targets.append(webrtc_user) %}{% endif %}
 {# Match every non-empty printable extension without Asterisk's noisy bare `_.` wildcard.
    The leading ASCII character set preserves UUID/GRUU, SIP/TEL and short-code users; the
    trailing `!` allows the original one-character minimum and is safe in these request-driven
@@ -120,9 +118,9 @@ same => n,Set(FILE(/logs/messages.txt,,,a)=IN SMS from ${MESSAGE(from)} at ${STR
 ; from the network; an empty value keeps its argument position so the manager stays compatible
 ; with an engine image built before the fields existed.
 same => n,TrySystem(/usr/local/bin/notify.py sms_in "${MESSAGE(from)}" "${BASE64_ENCODE(${MESSAGE(body)})}" "${MESSAGE_DATA(SMS_CONCAT_REF)}" "${MESSAGE_DATA(SMS_CONCAT_TOTAL)}" "${MESSAGE_DATA(SMS_CONCAT_SEQ)}" "${MESSAGE_DATA(SMS_TP_PID)}" "${MESSAGE_DATA(SMS_TP_DCS)}" "${MESSAGE_DATA(SMS_UDH_HEX)}" "${MESSAGE_DATA(SMS_TPDU_HEX)}" &)
-{% for t in msg_targets %}
-same => n,MessageSend(pjsip:{{ t }},${MESSAGE(from)},sip:{{ t }})
-{% endfor %}
+; The manager stores the text and the WebUI shows it from there. It is not also sent to the
+; browser softphone as a SIP MESSAGE: the softphone has no handler for one and answered every
+; such forward with 405 Method Not Allowed.
 same => n,Hangup()
 
 ; ===== Outgoing call from the authenticated browser softphone =====
@@ -157,7 +155,15 @@ same => n,TrySystem(/usr/local/bin/notify.py call_out "${EXTEN}" &)
 ; a channel created by Dial() gets its own variable space otherwise.
 same => n,Set(_USSDPEER=${EXTEN})
 same => n,Set(DIALTARGET=${STRREPLACE(EXTEN,#,%23)})
+{% if invite_uri_params %}
+; This line's carrier routes a call only with these request-URI parameters (T-Mobile US: 500
+; "CC_IMS_TRY_NEXT_MGCF_FAIL" without user=phone), so the URI is spelled out here rather than
+; letting the endpoint build it. Only the INVITE carries them: SMS leaves through the endpoint
+; unchanged. ';' starts a comment in Asterisk configuration, hence the escaping.
+same => n,Dial(PJSIP/volte_ims/sip:${DIALTARGET}@{{ realm }}\;{{ invite_uri_params | replace(";", "\\;") }},{{ ring_timeout }},b(ims-outbound-headers^s^1))
+{% else %}
 same => n,Dial(PJSIP/${DIALTARGET}@volte_ims,{{ ring_timeout }},b(ims-outbound-headers^s^1))
+{% endif %}
 ; Dial only returns here when the call was NEVER answered (reject/busy/no-answer/congestion);
 ; answered calls are bridged and tear down via BYE, never reaching this line.
 ; Save the REAL disposition for the call log BEFORE overriding the response (PJSIPHangup does

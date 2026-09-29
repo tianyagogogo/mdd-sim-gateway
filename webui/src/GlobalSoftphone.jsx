@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api.js'
-import { Softphone as Phone, microphoneMessage } from './softphone.js'
+import { Softphone as Phone, microphoneMessage, RELAY_UNAVAILABLE, RELAY_UNREACHABLE } from './softphone.js'
 import { useI18n } from './i18n.jsx'
+import { useContactNames } from './contactNames.js'
 
 const GREEN = '#22c55e'
 const RED = '#ef4444'
@@ -77,11 +78,15 @@ export default function GlobalSoftphone({ instances, excludedId, showToast }) {
             showToast?.(t(microphoneMessage(data)))
           } else if (type === 'audioblocked') {
             showToast?.(t('Browser blocked call audio. Click the page once and try again.'))
+          } else if (type === 'relayunavailable') {
+            showToast?.(t(RELAY_UNAVAILABLE))
+          } else if (type === 'relayunreachable') {
+            showToast?.(t(RELAY_UNREACHABLE))
           }
         }
-        phone = new Phone(onEvent, null)
+        phone = new Phone(onEvent, null, () => api.softphone(id))
+        if (!phone.start(prov, prov.host || location.hostname)) return
         phones.current.set(id, phone)
-        phone.start(prov, prov.host || location.hostname)
       }).catch(() => {})
     }
   }, [lineKey, excludedId]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -91,6 +96,10 @@ export default function GlobalSoftphone({ instances, excludedId, showToast }) {
     for (const phone of phones.current.values()) phone.stop()
     phones.current.clear()
   }, [])
+
+  // Asked for before the hook can early-return, and with the number it is ringing from: a
+  // caller who is in the address book should be named on the very first frame of the overlay.
+  const callerName = useContactNames(call?.number ? [call.number] : [], call?.id)[call?.number] || ''
 
   useEffect(() => {
     if (call?.state !== 'active' || !call.startedAt) { setDuration(0); return }
@@ -122,7 +131,8 @@ export default function GlobalSoftphone({ instances, excludedId, showToast }) {
         color: call.state === 'active' ? GREEN : '#60a5fa', fontSize: 38, fontWeight: 800 }}>
         {(call.number || '?').replace(/\D/g, '').slice(-2) || '?'}
       </div>
-      <div className="mono" style={{ fontSize: 26, fontWeight: 800 }}>{call.number}</div>
+      <div className={callerName ? '' : 'mono'} style={{ fontSize: 26, fontWeight: 800 }}>{callerName || call.number}</div>
+      {!!callerName && <div className="mono" style={{ fontSize: 13, color: 'var(--text-mute)' }}>{call.number}</div>}
       <div style={{ fontSize: 13, color: 'var(--text-mute)', marginTop: 7 }}>{call.line}</div>
       {call.state === 'active' && <div className="mono" style={{ color: GREEN, marginTop: 12 }}>{clock}</div>}
       {call.listenOnly && call.state !== 'ended' && <div style={{ fontSize: 12, color: '#f59e0b', marginTop: 8 }}>

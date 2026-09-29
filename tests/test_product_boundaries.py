@@ -17,13 +17,15 @@ class ProductBoundaryTests(unittest.TestCase):
         )
         return temp, paths
 
-    def test_sixth_sim_line_is_refused_but_existing_lines_remain_editable(self):
+    def test_line_past_the_limit_is_refused_but_existing_lines_remain_editable(self):
+        self.assertEqual(config.MAX_SIM_LINES, 10)
         temp, paths = self.temp_config()
         with temp, paths:
             for iid in range(1, config.MAX_SIM_LINES + 1):
                 config.upsert_instance({"id": str(iid), "name": f"SIM {iid}"})
+            extra = str(config.MAX_SIM_LINES + 1)
             with self.assertRaises(config.LineLimitError):
-                config.upsert_instance({"id": "6", "name": "SIM 6"})
+                config.upsert_instance({"id": extra, "name": f"SIM {extra}"})
             edited = config.upsert_instance({"id": "5", "name": "kept"})
             self.assertEqual(edited["name"], "kept")
 
@@ -90,15 +92,16 @@ class ProductBoundaryTests(unittest.TestCase):
             self.assertNotIn("activation_reminder", channel["events"])
             self.assertTrue(channel["events"]["software_update"])
 
-    def test_only_first_five_legacy_lines_are_startable(self):
+    def test_only_the_first_legacy_lines_up_to_the_limit_are_startable(self):
         temp, paths = self.temp_config()
+        limit = config.MAX_SIM_LINES
         with temp, paths:
             config.save({"instances": {
                 str(iid): {"id": str(iid), "index": iid}
-                for iid in range(1, 8)
+                for iid in range(1, limit + 3)
             }})
-            self.assertTrue(config.line_allowed("5"))
-            self.assertFalse(config.line_allowed("6"))
+            self.assertTrue(config.line_allowed(str(limit)))
+            self.assertFalse(config.line_allowed(str(limit + 1)))
 
 
 if __name__ == "__main__":

@@ -94,6 +94,15 @@ class UniquenessTests(unittest.TestCase):
             self.assertFalse(config.instance_name_taken(""))
             self.assertFalse(config.instance_name_taken("   "))
 
+    def test_runtime_only_api_fields_are_never_persisted(self):
+        with TempConfig() as cfg_temp:
+            cfg_temp.add("1", "Giff", proxy_country_effective="gb",
+                         status={"state": "connected"}, has_pin=True)
+            saved = config.get_instance("1")
+        self.assertNotIn("proxy_country_effective", saved)
+        self.assertNotIn("status", saved)
+        self.assertNotIn("has_pin", saved)
+
 
 @unittest.skipIf(main is None, "manager runtime dependencies are unavailable")
 class RenameApiTests(unittest.IsolatedAsyncioTestCase):
@@ -113,6 +122,61 @@ class RenameApiTests(unittest.IsolatedAsyncioTestCase):
         publish.assert_called_once_with()
         self.assertTrue(main._only_instance_name_changed(
             before, {**before, "name": "New name"}))
+
+    async def test_a_webui_rename_cleans_old_runtime_pollution_without_restart(self):
+        with TempConfig() as cfg_temp:
+            before = cfg_temp.add("1", "Old name", mcc="234", mnc="010")
+            # Reproduce a config written by the affected release. The real WebUI then reads
+            # this API-only value and sends the complete instance form back with the rename.
+            polluted = {**before, "proxy_country_effective": "gb"}
+            raw = config.load()
+            raw["instances"]["1"] = polluted
+            config.save(raw)
+            with patch.object(main.engine, "is_running", return_value=True), \
+                    patch.object(main, "_start_engine_checked") as restart, \
+                    patch.object(main.egress, "publish") as publish:
+                renamed = await main.api_instance_upsert(
+                    {**polluted, "name": "New name", "status": {"state": "connected"},
+                     "has_pin": False})
+
+            persisted = config.get_instance("1")
+
+        self.assertEqual(renamed["name"], "New name")
+        self.assertFalse(renamed["applied"])
+        self.assertNotIn("proxy_country_effective", persisted)
+        restart.assert_not_called()
+        publish.assert_called_once_with()
+
+    async def test_a_webui_rename_with_a_padded_mnc_and_live_reader_does_not_restart(self):
+        """Seen on the NAS with rc9: renaming line 4 also saved mnc "15" -> "015" (the form pads
+        it) and reader_index 5 -> 1 (the list shows the live index), and the line restarted."""
+        with TempConfig() as cfg_temp:
+            before = cfg_temp.add("4", "234-15-6315", mcc="234", mnc="15", reader_index=5,
+                                  reader_port="1-3.4.1")
+            with patch.object(main.engine, "is_running", return_value=True), \
+                    patch.object(main, "_reader_index_for_instance", return_value=1), \
+                    patch.object(main, "_reader_port_for_instance", return_value="1-3.4.1"), \
+                    patch.object(main, "_start_engine_checked") as restart, \
+                    patch.object(main.egress, "publish"):
+                renamed = await main.api_instance_upsert(
+                    {**before, "name": "voxi-THB", "mnc": "015", "reader_index": 1})
+
+        self.assertFalse(renamed["applied"])
+        restart.assert_not_called()
+
+    def test_a_reader_index_other_than_the_live_one_is_still_an_edit(self):
+        before = {"id": "4", "name": "a", "reader_index": 5}
+        self.assertFalse(main._only_instance_name_changed(
+            before, {**before, "name": "b", "reader_index": 2}, {"reader_index": 1}))
+        self.assertFalse(main._only_instance_name_changed(
+            before, {**before, "name": "b", "reader_index": 1}, {}))
+
+    def test_a_different_mnc_is_still_an_edit(self):
+        before = {"id": "4", "name": "a", "mcc": "234", "mnc": "15"}
+        self.assertTrue(main._only_instance_name_changed(
+            before, {**before, "name": "b", "mnc": "015"}))
+        self.assertFalse(main._only_instance_name_changed(
+            before, {**before, "name": "b", "mnc": "10"}))
 
     def test_an_operational_edit_is_not_treated_as_a_rename(self):
         before = {"id": "1", "name": "Old name", "proxy_country": "gb"}

@@ -11,6 +11,8 @@ data
 webui/dist
 control/.venv
 .venv
+.worktrees
+.codex-tmp-*
 
 # Local credentials, packet captures, and editor/OS state.
 *.pem

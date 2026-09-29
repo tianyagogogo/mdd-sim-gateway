@@ -9,9 +9,12 @@
 
 - 4G 不在线：检查“设备 → 详情”的 ModemManager 对象、注册、APN 和 bearer；运行设备诊断。
 - VoWiFi 停在部分连接：检查国家出口 UDP 验证、ePDG、SIM 是否开通 Wi‑Fi Calling、PIN 剩余次数及引擎日志。
+- 隧道已连接但 IMS 注册一直无响应（Asterisk 日志 `No response received ... on registration attempt`）：部分运营商会丢弃分片的 SIP 包，把隧道 MTU 调低通常能解决，例如 `SWU_TUN_MTU=1280`，需设在控制面上。原生安装写进 systemd drop-in（`/etc/systemd/system/mdd-sim-gateway-control.service.d/` 下的 `.conf`，内容为 `[Service]` 加 `Environment=SWU_TUN_MTU=1280`），再执行 `systemctl daemon-reload` 并重启控制面；docker 模式执行 `sudo SWU_TUN_MTU=1280 ./install.sh reload`，之后的重新加载和更新会沿用（要恢复默认值执行 `sudo SWU_TUN_MTU=default ./install.sh reload`，取值需在 1280–1500 之间）；全容器部署在 Compose 文件中 `control` 的 `environment` 里加上这一项。改动后需重建线路才生效。
 - 服务更新后 VoWiFi 突然停止：确认引擎容器仍存在，并检查控制面日志中是否把虚拟读卡器维护误判为 `card removed`。当前版本会在编排器退出信号到达时立即发布维护标记，并保留 45 秒重建窗口；旧版本应先恢复读卡桥再重新启动线路。
-- 浏览器电话一直未注册：它与 WebUI 同源连接 `/api/instances/<线路>/softphone/ws`。经反向代理访问时确认代理转发了 WebSocket 升级头；直连时确认线路引擎在运行。控制面日志中的 `softphone relay: engine ... unreachable` 表示引擎的 Asterisk 未在网桥地址 8088 上监听，通常是引擎镜像未随本版本刷新。
-- 能振铃但没声音：确认 `MDD_ADVERTISE_ADDR` 是软电话可达的主机地址，并检查 RTP 端口与浏览器麦克风权限。
+- 浏览器电话一直未注册：它与 WebUI 同源连接 `/api/instances/<线路>/softphone/ws`。经反向代理访问时确认代理转发了 WebSocket 升级头；控制面日志出现 `refused WebSocket ... from origin` 表示代理改写了 `Host`，需把代理地址加入"可信反向代理"并传递 `X-Forwarded-Host`；直连时确认线路引擎在运行。控制面日志中的 `softphone relay: engine ... unreachable` 表示引擎的 Asterisk 未在网桥地址 8088 上监听，通常是引擎镜像未随本版本刷新。
+- 能振铃但没声音：确认 `MDD_ADVERTISE_ADDR` 是软电话可达的主机地址，并检查 RTP 端口与浏览器麦克风权限。全容器部署下走国家出口的线路，还要确认 `mdd-sim-gateway-rtp-forward` 容器在运行（Control 日志中的 `RTP forwarder not updated` 会说明原因），线路在本版本之前创建的需重建一次才会被转发。此现象针对 direct 模式；relay 模式下浏览器无法连接中继时通话会在约 8 秒后自行结束并提示“无法连接媒体中继”，需要检查中继端口是否已在路由器/防火墙放行，经反向代理时确认该端口走的是 TCP/UDP 直通而不是 HTTP 转发规则。
+- 提示“媒体中继未就绪”，拒绝拨号：线路仍可注册和收发短信，只是通话被拒绝。执行 `sudo ./install.sh media`（或容器部署下的 `docker exec -w /app/control mdd-sim-gateway-control python -m app.media status`）查看中继状态，再用 `docker logs mdd-sim-gateway-relay` 检查中继容器本身是否正常启动。控制面每 30 秒会尝试重启一个停止或缺失的中继容器。
+- 启用 relay 模式被拒绝，提示引擎无法过滤媒体网络：nftables（nf_tables 及其 socket 匹配）和 iptables-legacy 两种过滤都加载不了，错误信息里附有两者各自的报错。内核不支持 nftables 的 socket 匹配时（例如 Synology DSM 的 4.4 内核）会自动改用 iptables-legacy，这时仍被拒绝通常是引擎镜像还是旧版本（未包含 iptables-legacy）。执行 `sudo ./install.sh reload --engines` 刷新引擎镜像后重试。
 - 读卡器未出现：先用 `lsusb` 确认 USB 层，再运行 `pcsc_scan` 检查 PC/SC 层。SCR Prime（`04d9:c001`）需执行一次 `sudo ./install.sh patchprime` 加入 libccid 设备表；之后支持热插拔。读卡器没有 4G 开关属于正常设计。
 - SIM 逻辑通道分配失败：查看“设备 → 硬件”中的已分配数量、通道用途和明确错误。系统会自动释放本轮部分分配；若持续失败，先重启对应线路，确认仍失败后再安排模块复位，不要只按底层 QMI 错误码猜测原因。
 - Telegram 失败：选择手动 HTTP/SOCKS 代理或已就绪的国家出口，并使用“测试”。
@@ -171,6 +174,23 @@ sudo systemctl restart docker
 
    检查是否生效：`mmcli -m 0` 的端口列表中备用 AT 口显示为 `(ignored)`。只有一个 AT 口的模块无法独占，发送彩信会报错说明原因，下载不受影响。规则写入或卸载时会重启 ModemManager，4G 数据连接会短暂断开。
 4. **状态“未知”**：请求已发出但没有收到 MMSC 答复。网关不会自动重发，以免对方收到两条彩信。
+   与之不同，模块在上传中途（最后一块之前）拒绝发送、或连接没有建立时，MMSC 不可能收到完整的请求，网关会分别在 3 秒和 10 秒后换新连接重发，三次都失败才标记为“失败”；错误信息里带有模块的原始答复和失败位置。
 5. **早已过期的通知**：模块离线期间积压、已超过 MMSC 保存期限的通知直接标记为“已过期”，不请求 MMSC，也不推送；仍可手动重试。
+6. **附件被拒绝**：网关按文件内容（而不是扩展名或浏览器声明的类型）判断附件，添加附件时就会检查，被拒绝的文件不会进入待发送列表。网页端、直接调用 API 的客户端走同一套检查。当前格式表随“彩信设置”接口的 `formats` 字段返回，定义在 `control/app/mms_media.py`。
+
+   | 策略 | 格式 |
+   |---|---|
+   | 发送 | JPEG、GIF、PNG；AMR、AMR-WB、MP3、AAC（m4a）；3GP / MP4 视频（H.263、MPEG-4、H.264，配 AMR 或 AAC 声音）；纯文本；vCard 2.1/3.0；vCalendar 1.0、iCalendar 2.0 |
+   | 转换 | WebP、BMP、HEIC/HEIF、AVIF：网关转成 JPEG 后发送 |
+   | 仅接收 | 其他格式（如 MOV、WAV、WBMP）：收到后保存并提供下载，浏览器无法播放时显示“不支持预览” |
+
+   常见拒绝原因：iPhone 默认录制的 HEVC（H.265）视频（请导出为 H.264）、vCard 4.0（请导出为 3.0）、内容与声明类型不符或已损坏的文件。
+7. **图片由网关压缩**：添加附件时文件即上传到网关，网关在线路限额内为所有图片分配空间，从原图按“先尺寸（最长边 1600 像素起）、后画质”重新编码为 JPEG，界面显示每张图压缩前后的大小和整条彩信的合计。已符合手机显示要求、放得下且不超过 1600 像素的图片不重新编码，只无损去掉 EXIF、XMP 等元数据；发出的图片都不带拍摄位置等元数据（带旋转信息的照片会重新编码为正向）。编写期间原图暂存在数据目录 `mms-staging/`，发送后只保存实际发出的版本，未发送的暂存文件 24 小时后清理；每条线路最多同时暂存 20 个附件、合计 64 MB，整机合计 256 MB，超出时会提示先发送或移除已添加的附件。声音、视频和动态 GIF 不压缩，超限时直接提示；视频压缩暂未实现。
+   线路的大小上限是**每条彩信**一个：多个附件放在同一条彩信里时共用这个上限，附件越多每张越小。添加两个以上附件时可以选择“合并为一条”（默认）或“每张单独发送”：后者每个附件单独成为一条彩信，各自用满上限，正文和主题随第一条发送，各条按附件顺序依次提交。两种方式各自从原图压缩，切换时界面显示的大小和缩略图都会更新为对应方式的版本。
+   **转换占用的内存**：图片在独立的工作进程里解码，解码完立即缩到 1600 像素，之后所有尺寸和画质都从这份缩小的图出发；改动正文时只重新编码，不再解码。解码本身的内存随原图增长：HEIC 只能整张解码，约每像素 8 字节，1200 万像素约 95 MB、2400 万像素约 180 MB、4800 万像素约 360 MB；JPEG 按目标尺寸缩小解码，4800 万像素也不到 30 MB。网关在解码前从文件头估算这次需要的内存，在预算内才开始：内存充足的机器同时转换多张（默认等于可用 CPU 数），内存小的机器大图依次进行，其余等待。单张就超过整个预算时，JPEG 按更小的尺寸解码并在界面标注“网关内存不足，已缩小发送”，其他格式（如 HEIC）直接拒绝并说明需要多少内存。万一估算偏小，内核只会结束该工作进程，控制面不受影响。
+   预算默认按控制面所在 cgroup 的内存上限（容器的 `mem_limit`，默认 512 MB）减去控制面已用内存和 64 MB 余量；没有上限的主机取可用内存的一半。可用 `MDD_MMS_CONVERT_WORKERS`（同时转换数）和 `MDD_MMS_CONVERT_MEMORY`（MB）手动指定：全容器部署写在 Compose 目录的 `.env` 里后重建控制面容器；主机安装用 `systemctl edit mdd-sim-gateway-control` 加 `Environment=` 后重启。上传的文件超过 1 MB 时暂存在数据目录 `uploads/`（而不是容器里只有 32 MB 的 `/tmp`），进程退出即释放。
+8. **大小限额按最终报文计算**：线路的彩信大小上限针对打包后的整条 m-send-req（含 SMIL、收件人、主题和各类头部），而不只是附件之和；发送时网关按最终的正文和收件人再计算一次，超限在提交 MMSC 前就会拒绝。
+9. **兼容范围**：发送的报文为 MMS 封装 1.2（OMA-TS-MMS_ENC），SMIL 按 OMA MMS 一致性文档的布局（`Image` / `Text` 区域；每个部分有消息内唯一的 Content-ID 和 ASCII Content-Location，SMIL 按 Content-Location 引用，与实测 iPhone 经运营商发来的彩信一致；原文件名只用于显示和下载；音视频幻灯片时长取媒体实际时长）。格式表参照 OMA 内容类别至 Video Rich 选取，另加手机普遍支持的 MP3/AAC 和名片、日历。这是结构性检查，不等于通过了标准一致性认证；各运营商和手机之间的互通仍以实测为准。
+10. **附件存储与备份**：附件文件保存在数据目录 `mms/<消息 ID>/`，文件名由网关生成，原始文件名只作为元数据。升级前的数据库备份（`backups/*.sqlite`）旁边同名的 `.mms` 目录是对应的附件；恢复时二者一起放回（`.sqlite` 改回 `mdd-sim-gateway.sqlite`，`.mms` 目录改名为 `mms`）。设置“备份与更新”中“创建本地备份”生成的完整备份包含一致的数据库快照和它引用的全部附件，不含编写中的暂存附件。
 
 提交问题前下载“诊断 → 脱敏支持包”，并再次确认其中没有个人信息。

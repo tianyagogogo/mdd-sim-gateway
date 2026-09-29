@@ -23,6 +23,31 @@ function supportsCellular(device) {
   return device?.device_type !== 'reader' && capability(device, 'cellular').actual !== 'unsupported'
 }
 
+// The carrier's verdict on Wi-Fi Calling. A switched-off line on such a carrier is not a
+// fault, so it is shown as "not supported" rather than as a plain "off".
+function vowifiUnsupported(device) {
+  return device?.capabilities?.vowifi?.support?.status === 'unsupported'
+}
+
+function capabilityBadgeState(device, kind, actual) {
+  return kind === 'vowifi' && actual === 'off' && vowifiUnsupported(device) ? 'unsupported' : actual
+}
+
+// One badge per capability, on every device, so the list reads the same way throughout: a
+// modem whose 4G works must not look broken because VoWiFi does not, and a smart-card reader
+// says outright that it has no 4G rather than leaving the badge out.
+function DeviceStatusBadges({ device }) {
+  const { t } = useI18n()
+  if (device.present === false) return <Badge state="error">{t('Offline')}</Badge>
+  const vowifi = capability(device, 'vowifi').actual
+  const badges = [
+    ['4g', supportsCellular(device) ? capability(device, 'cellular').actual : 'unsupported', t('4G')],
+    ['vowifi', capabilityBadgeState(device, 'vowifi', vowifi), 'VoWiFi'],
+  ]
+  return <span className="u-badge-row">{badges.map(([key, state, label]) =>
+    <Badge key={key} state={state}>{`${label} · ${t(`cap.${state}`)}`}</Badge>)}</span>
+}
+
 function exitNodeLabel(device, t) {
   // The node picker lives on the settings page. Showing the running node here without saying
   // it disagrees with the pinned one reads as "my setting was ignored".
@@ -104,10 +129,10 @@ function LineActivity({ device, compact = false }) {
 function LogicalChannels({ value }) {
   const { t } = useI18n()
   if (!value) return null
-  return <><div className="u-detail"><span>{t('SIM logical channels')}</span><b>{t('{used} / {total} allocated', { used: value.allocated ?? 0, total: value.capacity ?? 3 })} · {t(`channel.status.${value.status || 'stopped'}`)}</b></div>{(value.items || []).map(item => <div className="u-detail" key={`${item.slot}-${item.channel}`}><span>{t('Logical channel {channel}', { channel: item.channel })}</span><b>{t(`channel.role.${item.role}`)}</b></div>)}{value.error && <p className="u-error">{value.error}</p>}</>
+  return <><div className="u-detail"><span>{t('SIM logical channels')}</span><b>{t('{used} / {total} allocated', { used: value.allocated ?? 0, total: value.capacity ?? 3 })} · {t(`channel.status.${value.status || 'stopped'}`)}{value.shared && ` · ${t('channel.shared')}`}</b></div>{(value.items || []).map(item => <div className="u-detail" key={`${item.slot}-${item.channel}`}><span>{t('Logical channel {channel}', { channel: item.channel })}</span><b>{t(`channel.role.${item.role}`)}</b></div>)}{value.error && <p className="u-error">{value.error}</p>}</>
 }
 
-export function CapabilitySwitch({ device, kind, onChanged, showToast, compact = false }) {
+export function CapabilitySwitch({ device, kind, onChanged, showToast, compact = false, onSetup }) {
   const { t } = useI18n()
   const [submitting, setSubmitting] = useState(false)
   const [pendingTarget, setPendingTarget] = useState(null)
@@ -166,14 +191,78 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
   // A healthy line is reported by two feeds: the periodic device snapshot and live status
   // events. One includes the detailed OK reason while the other may omit it. Render one
   // canonical healthy message so those feeds cannot make the text flicker every few seconds.
+  const cellular = device.cellular || {}
+  const unsupported = kind === 'vowifi' && vowifiUnsupported(device)
+  // For a carrier without Wi-Fi Calling the device snapshot explains why, while live line
+  // events report the stopped line ("Stopped."); the two alternated every few seconds. The
+  // carrier's answer is the one that tells the user something, so it wins while the line is off.
+  const unsupportedReason = unsupported && c.actual === 'off'
+    ? (device.capabilities?.vowifi?.support?.reason || '') : ''
   const detail = c.actual === 'on'
-    ? t('Working — connected to the carrier over Wi-Fi.')
+    ? (kind === 'vowifi' ? t('Working — connected to the carrier over Wi-Fi.')
+      : kind === 'cellular' ? [t('Mobile data connected'), cellular.operator, cellular.ip].filter(Boolean).join(' · ')
+      : t('cap.help.on'))
+    : unsupportedReason ? t(unsupportedReason)
     : (c.reason ? t(c.reason) : t(`cap.help.${c.actual}`))
+  const badgeState = capabilityBadgeState(device, kind, displayedState)
+  // A draft line starts by itself once these are filled in. IMEI belongs to the reader
+  // (Hardware tab); every other field belongs to the SIM (SIM tab).
+  const setupMissing = kind === 'vowifi' && device.provisioning?.state === 'draft'
+    ? (device.provisioning?.missing || []) : []
+  const needsImei = setupMissing.includes('imei')
+  const needsSim = setupMissing.some(key => key !== 'imei')
+  // IMSI, MCC/MNC and SMSC come from the card itself. A reader can miss them on the read at
+  // insertion and return them on the next, so offer that before asking anyone to type them.
+  const needsCardRead = setupMissing.some(key => ['imsi', 'mcc_mnc', 'smsc'].includes(key))
+  const [rereading, setRereading] = useState(false)
+  const rereadSim = async () => {
+    setRereading(true)
+    try {
+      const result = await api.rereadDeviceSim(device.id)
+      const cardFields = (result.missing || []).filter(name => ['IMSI', 'MCC/MNC', 'SMSC'].includes(name))
+      showToast?.(result.completing ? t('SIM read again; the line is being completed and started')
+        : cardFields.length ? t('The SIM still did not report: {fields}. Enter them on the SIM tab.', { fields: cardFields.join(t('list separator')) })
+        : t('SIM read again'))
+      await onChanged?.()
+    } catch (e) { showToast?.(`${t('Error')}: ${e.message}`) }
+    finally { setRereading(false) }
+  }
   return <div className={`u-capability ${compact ? 'compact' : ''}`}>
-    <div><b>{title}</b><div className="u-cap-detail">{detail}</div></div>
-    <div className="u-cap-actions">{canRetry && <button className="btn btn-ghost" disabled={submitting} onClick={() => change(true, true)}>{t('Restart line')}</button>}<Badge state={displayedState}>{device.present === false ? t('Offline') : null}</Badge><button className={`u-switch ${displayedDesired ? 'on' : ''}`} role="switch" aria-checked={displayedDesired}
+    <div><b>{title}</b><div className="u-cap-detail">{detail}</div>
+      {!!setupMissing.length && <div className="u-cap-setup">
+        <span>{t('Missing information')}: {setupMissing.map(key => t(`setup.field.${key}`)).join(t('list separator'))}</span>
+        {needsCardRead && <button className="btn btn-ghost" disabled={rereading} onClick={rereadSim}>{t(rereading ? 'Reading…' : 'Read SIM again')}</button>}
+        {onSetup && needsImei && <button className="btn btn-ghost" onClick={() => onSetup('hardware')}>{t('Set IMEI')}</button>}
+        {onSetup && needsSim && <button className="btn btn-ghost" onClick={() => onSetup('sim')}>{t('Complete SIM details')}</button>}
+      </div>}
+    </div>
+    <div className="u-cap-actions">{canRetry && <button className="btn btn-ghost" disabled={submitting} onClick={() => change(true, true)}>{t(unsupported ? 'Try again' : 'Restart line')}</button>}{unsupported && !c.desired && !unavailable && <button className="btn btn-ghost" disabled={pending} onClick={() => change(true)}>{t('Try anyway')}</button>}<Badge state={badgeState}>{device.present === false ? t('Offline') : null}</Badge><button className={`u-switch ${displayedDesired ? 'on' : ''}`} role="switch" aria-checked={displayedDesired}
       aria-label={title} disabled={pending || unavailable} onClick={toggle}><span /></button></div>
   </div>
+}
+
+// How call media reaches the lines. Shown only: switching rebuilds every line, publishes or
+// withdraws host ports and starts or removes the relay, so it is the installer's job
+// (install.sh media relay | direct).
+function MediaModePanel() {
+  const { t } = useI18n()
+  const [media, setMedia] = useState(null)
+  useEffect(() => {
+    let alive = true
+    api.media().then((value) => { if (alive) setMedia(value) }).catch(() => {})
+    return () => { alive = false }
+  }, [])
+  if (!media) return null
+  const relay = media.mode === 'relay'
+  const ready = media.relay?.state === 'ready'
+  return <div className="u-form-grid"><div>
+    <label>{t('Call media')}</label>
+    <p>
+      {relay ? t('Media relay, port {port}', { port: media.public_port || media.port }) : t('Direct (each line publishes its RTP ports)')}
+      {relay && <> · <Badge state={ready ? 'on' : 'error'}>{ready ? t('Relay ready') : t('Relay unavailable')}</Badge></>}
+    </p>
+    <p className="u-note">{t('Switch with install.sh media relay or install.sh media direct on the gateway host.')}</p>
+  </div></div>
 }
 
 function deviceTitle(d, index) { return d.name || d.label || d.model || `Device ${index + 1}` }
@@ -210,9 +299,15 @@ function deviceIdentityLine(d, t) {
   return `${simName(d, t)} · ${number || t('SIM detected')}`
 }
 
-function HardwarePanel({ device, refreshDevices, showToast }) {
+function HardwarePanel({ device, refreshDevices, showToast, focusImei = false, onSetup }) {
   const { t } = useI18n()
   const [imei, setImei] = useState(device.imei || '')
+  const imeiInput = useRef(null)
+  useEffect(() => {
+    if (!focusImei || !imeiInput.current) return
+    imeiInput.current.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    imeiInput.current.focus()
+  }, [focusImei])
   const [saving, setSaving] = useState(false)
   useEffect(() => setImei(device.imei || ''), [device.id, device.imei])
   const isReader = device.device_type === 'reader'
@@ -223,7 +318,16 @@ function HardwarePanel({ device, refreshDevices, showToast }) {
     try {
       const result = await api.saveDeviceHardware(device.id, { imei: digits })
       await refreshDevices()
-      showToast(t(result.applied ? 'Hardware IMEI saved and the active line was restarted' : 'Hardware IMEI saved'))
+      const stillMissing = (result.missing || []).filter(name => name !== 'IMEI')
+      if (!result.started && stillMissing.length) {
+        // The IMEI was the operator's last known step; say plainly that the line still waits.
+        showToast(t('Hardware IMEI saved. The line starts once the SIM details are complete: {fields}',
+          { fields: stillMissing.join(t('list separator')) }))
+        onSetup?.('sim')
+      } else {
+        showToast(t(result.started ? 'Hardware IMEI saved; the line was completed and started automatically'
+          : result.applied ? 'Hardware IMEI saved and the active line was restarted' : 'Hardware IMEI saved'))
+      }
     } catch (error) { showToast(`${t('Error')}: ${error.message}`) }
     finally { setSaving(false) }
   }
@@ -252,12 +356,15 @@ function HardwarePanel({ device, refreshDevices, showToast }) {
     {isReader && <div className="u-hardware-action u-hardware-imei">
       <div className="u-hardware-action-copy"><h4>{t('Hardware IMEI')}</h4>
         <p>{t('This IMEI belongs to the physical reader. Any SIM inserted here uses it automatically.')}</p>
+        {!device.imei && device.provisioning?.missing?.includes('imei') &&
+          <p className="u-error">{t('VoWiFi is waiting for a 15-digit IMEI. Save it here and the new line will start automatically.')}</p>}
       </div>
-      <input className="mono" inputMode="numeric" maxLength={18} value={imei}
+      <input ref={imeiInput} className="mono" inputMode="numeric" maxLength={18} value={imei}
         onChange={event => setImei(event.target.value.replace(/[^0-9 -]/g, ''))}
         placeholder={t('15-digit IMEI required for VoWiFi')} />
-      <button className="btn btn-primary" disabled={saving} onClick={save}>{t('Save')}</button>
+      <button className="btn btn-primary" disabled={saving} onClick={save}>{t(!device.imei && device.provisioning?.missing?.includes('imei') ? 'Save IMEI and start line' : 'Save')}</button>
     </div>}
+    <CustomModelNotice device={device} refreshDevices={refreshDevices} showToast={showToast}/>
     <div className="u-hardware-action u-hardware-danger">
       <div className="u-hardware-action-copy"><h4>{t('Remove device record')}</h4>
         <p>{t('Only disconnected devices can be removed; SIM and line configurations are preserved.')}</p>
@@ -267,13 +374,84 @@ function HardwarePanel({ device, refreshDevices, showToast }) {
   </div>
 }
 
+const PROBE_MESSAGES = {
+  usable: 'Added as a custom model. Its SIM reader appears in a few seconds.',
+  unverified: 'Added as a custom model. No usable SIM was inserted, so insert one to confirm it can carry VoWiFi.',
+  unsupported: 'The module did not let the SIM open a logical channel through AT+CSIM, so it cannot carry VoWiFi.',
+  no_at_port: 'None of its serial ports answered AT commands.',
+  port_busy: 'Its serial port is in use by another program: {detail}',
+  modemmanager_failed: 'ModemManager could not pass commands to the module: {detail}',
+  not_found: 'The device is no longer connected, or is already recognised.',
+}
+
+// Modem-like USB devices that match no known model. Nothing is sent to them until the
+// operator asks; the test finds the AT port and checks SIM access through AT+CSIM.
+function UnrecognizedUsbDevices({ refreshDevices, showToast }) {
+  const { t } = useI18n()
+  const [candidates, setCandidates] = useState([])
+  const [probing, setProbing] = useState('')
+  const [outcome, setOutcome] = useState(null)
+  const load = () => api.usbCandidates().then(value => setCandidates(value.candidates || [])).catch(() => {})
+  useEffect(() => { load(); const timer = setInterval(load, 15000); return () => clearInterval(timer) }, [])
+  const tryDevice = async candidate => {
+    setProbing(candidate.usb_path); setOutcome(null)
+    try {
+      const result = await api.probeUsbCandidate(candidate.usb_path)
+      setOutcome({ ...result, usb_path: candidate.usb_path })
+      if (result.saved) { showToast(t('Custom modem model added')); await refreshDevices?.(); await load() }
+    } catch (error) { showToast(`${t('Error')}: ${error.message}`) }
+    finally { setProbing('') }
+  }
+  if (!candidates.length && !outcome) return null
+  return <div className="card u-panel u-usb-candidates">
+    <h3>{t('Unrecognised USB devices')}</h3>
+    <p className="u-note">{t('These look like cellular modules but match no known model. Testing one finds its AT port and checks that the SIM can be reached through standard AT+CSIM commands; a module that passes is added as a custom model.')}</p>
+    {candidates.map(candidate => <div className="u-hardware-action" key={candidate.usb_path}>
+      <div className="u-hardware-action-copy">
+        <h4>{candidate.product || candidate.manufacturer || t('USB device')}</h4>
+        <p className="mono">{candidate.vid}:{candidate.pid} · USB {candidate.usb_path} · {t('{count} serial ports', { count: candidate.serial_ports })}</p>
+      </div>
+      <button className="btn btn-primary" disabled={!!probing} onClick={() => tryDevice(candidate)}>
+        {probing === candidate.usb_path ? t('Testing… (up to a minute)') : t('Try this device')}</button>
+    </div>)}
+    {outcome && <div className={outcome.saved ? 'u-note' : 'u-error'}>
+      <p>{t(PROBE_MESSAGES[outcome.result] || 'The test did not finish: {detail}', { detail: outcome.detail || '' })}</p>
+      {!!outcome.steps?.length && <details><summary>{t('Test details')}</summary>
+        <pre className="mono">{outcome.steps.join('\n')}</pre></details>}
+    </div>}
+    <p className="u-note">{t('Custom models are supported for VoWiFi and SMS. MMS, call audio and the IMS switch depend on the module.')}</p>
+  </div>
+}
+
+function CustomModelNotice({ device, refreshDevices, showToast }) {
+  const { t } = useI18n()
+  const model = device.custom_model
+  if (!model) return null
+  const remove = async () => {
+    if (!window.confirm(t('Remove this custom model? The gateway stops using this module until it is tested again.'))) return
+    try {
+      await api.deleteModemProfile(model.vid, model.pid)
+      await refreshDevices()
+      showToast(t('Custom modem model removed'))
+    } catch (error) { showToast(`${t('Error')}: ${error.message}`) }
+  }
+  return <div className="u-hardware-action">
+    <div className="u-hardware-action-copy"><h4>{t('Custom model (experimental)')}</h4>
+      <p>{t(model.verified ? 'Added by a test on this gateway, and its SIM logical channels have worked.'
+        : 'Added by a test on this gateway without a usable SIM. It is confirmed once its SIM logical channels work.')}</p>
+      <p className="mono">{model.vid}:{model.pid}</p>
+    </div>
+    <button className="btn btn-danger-outline" onClick={remove}>{t('Remove custom model')}</button>
+  </div>
+}
+
 function Discovering({ t }) {
   return <div className="u-empty"><div className="u-empty-icon u-empty-spinner">◌</div>
     <h3>{t('Detecting devices…')}</h3>
     <p>{t('The gateway is reading the connected readers and modems. This takes a few seconds after a restart.')}</p></div>
 }
 
-export function UnifiedOverview({ devices, discovering, loadErrors, refreshDevices, setView, showToast, instances, setSelectedDeviceId, setSelected, subscribe }) {
+export function UnifiedOverview({ devices, discovering, loadErrors, refreshDevices, setView, showToast, instances, setSelectedDeviceId, setSelected, subscribe, setDeviceTab }) {
   const { t } = useI18n()
   // The backend may already know the physical devices while its first card scan is still in
   // progress. Do not render those partial rows as authoritative "No SIM" results.
@@ -292,31 +470,100 @@ export function UnifiedOverview({ devices, discovering, loadErrors, refreshDevic
       !devices.length ? <Empty title={t('No communication devices found')} detail={t('Connect a modem or smart-card reader. Discovery updates automatically.')} /> :
       <div className="u-device-grid">{devices.map((d, i) => <div className="card u-device-card" key={d.id}>
         <div className="u-card-head"><div><h2>{deviceTitle(d, i)}</h2><p>{deviceIdentityLine(d, t)}</p></div><Badge state={d.present === false ? 'error' : 'on'}>{d.present === false ? t('Offline') : t('Detected')}</Badge></div>
-        <div className="u-card-body">{supportsCellular(d) && <CapabilitySwitch key={`${d.id}:cellular`} device={d} kind="cellular" compact onChanged={refreshDevices} showToast={showToast} />}<CapabilitySwitch key={`${d.id}:vowifi`} device={d} kind="vowifi" compact onChanged={refreshDevices} showToast={showToast} /><LineActivity device={d} compact />{capability(d, 'vowifi').desired && <VowifiHistory instanceId={d.instance_id} subscribe={subscribe} compact />}
+        <div className="u-card-body">{supportsCellular(d) && <CapabilitySwitch key={`${d.id}:cellular`} device={d} kind="cellular" compact onChanged={refreshDevices} showToast={showToast} />}<CapabilitySwitch key={`${d.id}:vowifi`} device={d} kind="vowifi" compact onChanged={refreshDevices} showToast={showToast} onSetup={tab => { setSelectedDeviceId(d.id); setDeviceTab?.(tab); setView('devices') }} /><LineActivity device={d} compact />{capability(d, 'vowifi').desired && <VowifiHistory instanceId={d.instance_id} subscribe={subscribe} compact />}
           <div className="u-details"><div className="u-detail"><span>{t('Carrier')}</span><b>{carrierLabel(d, t)}</b></div><div className="u-detail"><span>{t('Country exit')}</span><b className="u-proxy-node-text"><ProxyNodeName text={exitNodeLabel(d, t) || d.proxy_node || t('Not connected')} /></b></div></div>
         </div><div className="u-card-foot"><button className="btn btn-ghost" onClick={() => { if (d.instance_id) setSelected(String(d.instance_id)); setView('calls') }}>{t('Call')}</button><button className="btn btn-ghost" onClick={() => { if (d.instance_id) setSelected(String(d.instance_id)); setView('messages') }}>{t('Message')}</button><button className="btn btn-primary" onClick={() => { setSelectedDeviceId(d.id); setView('devices') }}>{t('Details')}</button></div>
       </div>)}</div>}
   </div>
 }
 
-export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, instances, cards, selected, setSelected, refresh, showToast, selectedDeviceId, setSelectedDeviceId, subscribe }) {
-  const { t, language } = useI18n(); const [tab, setTab] = useState('status')
+export function DevicesPage({ devices, discovering, loadErrors, refreshDevices, instances, cards, selected, setSelected, refresh, showToast, selectedDeviceId, setSelectedDeviceId, subscribe, deviceTab, setDeviceTab }) {
+  const { t, language } = useI18n(); const [tab, setTab] = useState('status'); const [focusImei, setFocusImei] = useState(false)
+  const openSetup = next => { setTab(next); setFocusImei(next === 'hardware') }
+  useEffect(() => { if (deviceTab) { openSetup(deviceTab); setDeviceTab?.(null) } }, [deviceTab])
   const active = devices.some(device => device.id === selectedDeviceId) ? selectedDeviceId : devices[0]?.id
   useEffect(() => { if (active && active !== selectedDeviceId) setSelectedDeviceId(active) }, [active, selectedDeviceId, setSelectedDeviceId])
   const d = devices.find(x => x.id === active)
   useEffect(() => { if (d && !supportsCellular(d) && tab === 'cellular') setTab('status') }, [d, tab])
   if (loadErrors?.devices && !devices.length) return <p className="u-error">{t('Loading failed')}</p>
   if (discovering) return <Discovering t={t} />
-  if (!d) return discovering ? <Discovering t={t} /> : <Empty title={t('No communication devices found')} detail={t('Connect a modem or smart-card reader. Discovery updates automatically.')} />
+  if (!d) return discovering ? <Discovering t={t} /> : <><Empty title={t('No communication devices found')} detail={t('Connect a modem or smart-card reader. Discovery updates automatically.')} /><UnrecognizedUsbDevices refreshDevices={refreshDevices} showToast={showToast}/></>
   const tabs = [['status',t('Status')],['sim','SIM'],...(supportsCellular(d) ? [['cellular',t('4G network')]] : []),['vowifi','VoWiFi'],['hardware',t('Hardware')]]
-  return <div className="u-split"><aside className="card u-device-list">{devices.map((x,i)=><button key={x.id} className={`u-device-option ${x.id===active?'active':''}`} onClick={()=>setSelectedDeviceId(x.id)}><b className="u-device-option-name">{deviceTitle(x,i)}</b><span className="u-device-option-sim">{deviceSimLine(x, t, language)}</span><span className="u-device-option-status"><Badge state={x.present === false ? 'error' : capability(x,'vowifi').actual} /></span></button>)}</aside>
+  return <div className="u-split"><aside className="card u-device-list">{devices.map((x,i)=><button key={x.id} className={`u-device-option ${x.id===active?'active':''}`} onClick={()=>setSelectedDeviceId(x.id)}><b className="u-device-option-name">{deviceTitle(x,i)}</b><span className="u-device-option-sim">{deviceSimLine(x, t, language)}</span><span className="u-device-option-status"><DeviceStatusBadges device={x} /></span></button>)}<UnrecognizedUsbDevices refreshDevices={refreshDevices} showToast={showToast}/></aside>
     <section className="u-page"><div className="u-page-heading"><div><h2>{deviceTitle(d, devices.indexOf(d))}</h2><p>{deviceTypeName(d, t)} · {stablePathName(d, t)}</p></div></div><div className="u-tabs">{tabs.map(([k,l])=><button key={k} className={tab===k?'active':''} onClick={()=>setTab(k)}>{l}</button>)}</div>
-      {tab==='status' && <div className="card u-panel">{supportsCellular(d) ? <><CapabilitySwitch key={`${d.id}:cellular`} device={d} kind="cellular" onChanged={refreshDevices} showToast={showToast}/><CapabilitySwitch key={`${d.id}:flight`} device={d} kind="flight" onChanged={refreshDevices} showToast={showToast}/></> : <p className="u-note">{t('This is a smart-card reader. It provides SIM access for VoWiFi and has no 4G radio.')}</p>}<CapabilitySwitch key={`${d.id}:vowifi`} device={d} kind="vowifi" onChanged={refreshDevices} showToast={showToast}/><LineActivity device={d}/><p className="u-note">{t('Cellular data, flight mode and VoWiFi are independent controls. Flight mode disables modem RF; the 4G switch only connects or disconnects mobile data.')}</p><p className="u-note">{t('Software support means the technical path is implemented. Actual availability still depends on the SIM plan, carrier, region, modem firmware and device-identity policy.')}</p></div>}
+      {tab==='status' && <div className="card u-panel">{supportsCellular(d) ? <><CapabilitySwitch key={`${d.id}:cellular`} device={d} kind="cellular" onChanged={refreshDevices} showToast={showToast}/><CapabilitySwitch key={`${d.id}:flight`} device={d} kind="flight" onChanged={refreshDevices} showToast={showToast}/></> : <p className="u-note">{t('This is a smart-card reader. It provides SIM access for VoWiFi and has no 4G radio.')}</p>}<CapabilitySwitch key={`${d.id}:vowifi`} device={d} kind="vowifi" onChanged={refreshDevices} showToast={showToast} onSetup={openSetup}/><LineActivity device={d}/><p className="u-note">{t('Cellular data, flight mode and VoWiFi are independent controls. Flight mode disables modem RF; the 4G switch only connects or disconnects mobile data.')}</p><p className="u-note">{t('Software support means the technical path is implemented. Actual availability still depends on the SIM plan, carrier, region, modem firmware and device-identity policy.')}</p></div>}
       {tab==='sim' && <div className="card u-panel"><SimConfig instances={instances} selected={selected} refresh={refresh} cards={cards} setSelected={setSelected} targetDevice={d}/></div>}
-      {tab==='cellular' && <div className="card u-panel"><h3>{t('4G network')}</h3>{d.cellular ? <div className="u-details cols"><div className="u-detail"><span>{t('Registration')}</span><b>{d.cellular.registration || t('Not connected')}</b></div><div className="u-detail"><span>{t('Operator')}</span><b>{d.cellular.operator || t('Not connected')}</b></div><div className="u-detail"><span>APN</span><b>{d.cellular.apn || t('Automatic')}</b></div><div className="u-detail"><span>{t('IP address')}</span><b>{d.cellular.ip || t('Waiting')}</b></div><div className="u-detail"><span>{t('Signal')}</span><b>{d.cellular.signal == null ? t('Waiting') : `${d.cellular.signal}%`}</b></div><div className="u-detail"><span>{t('Traffic')}</span><b>↓ {formatBytes(d.cellular.rx_bytes)} · ↑ {formatBytes(d.cellular.tx_bytes)}</b></div><div className="u-detail"><span>{t('Data profile')}</span><b>{d.cellular.profile || t('Automatic')}</b></div><div className="u-detail"><span>{t('Network interface')}</span><b>{d.cellular.interface || t('Waiting')}</b></div></div>:<Empty title={t('Cellular data not connected')} detail={t('Turn on 4G to let the per-device ModemManager backend establish a data bearer.')} />}</div>}
+      {tab==='cellular' && <div className="card u-panel"><h3>{t('4G network')}</h3>{d.cellular ? <div className="u-details cols"><div className="u-detail"><span>{t('Registration')}</span><b>{d.cellular.registration || t('Not connected')}</b></div><div className="u-detail"><span>{t('Operator')}</span><b>{d.cellular.operator || t('Not connected')}</b></div><div className="u-detail"><span>APN</span><b>{d.cellular.apn || t('Automatic')}</b></div><div className="u-detail"><span>{t('IP address')}</span><b>{d.cellular.ip || t('Waiting')}</b></div><div className="u-detail"><span>{t('Signal')}</span><b>{d.cellular.signal == null ? t('Waiting') : `${d.cellular.signal}%`}</b></div><div className="u-detail"><span>{t('Traffic')}</span><b>↓ {formatBytes(d.cellular.rx_bytes)} · ↑ {formatBytes(d.cellular.tx_bytes)}</b></div><div className="u-detail"><span>{t('Data profile')}</span><b>{d.cellular.profile || t('Automatic')}</b></div><div className="u-detail"><span>{t('Network interface')}</span><b>{d.cellular.interface || t('Waiting')}</b></div></div>:<Empty title={t('Cellular data not connected')} detail={t('Turn on 4G to let the per-device ModemManager backend establish a data bearer.')} />}<ModemImsPanel key={d.id} device={d} showToast={showToast}/><ModemVoiceAudioPanel key={`${d.id}:voice`} device={d}/></div>}
       {tab==='vowifi' && <div className="card u-panel"><h3>VoWiFi</h3><CountryExitControl device={d} refresh={refresh} showToast={showToast}/><LineActivity device={d}/><VowifiHistory instanceId={d.instance_id} subscribe={subscribe}/><div className="u-details cols"><div className="u-detail"><span>ePDG / IKE</span><b>{typeof d.vowifi?.epdg === 'object' ? (d.vowifi.epdg.ike_reason || (d.vowifi.epdg.pcscf ? t('Tunnel connected') : t('Waiting'))) : (d.vowifi?.epdg || d.status?.state || t('Not connected'))}</b></div><div className="u-detail"><span>IMS / SIP</span><b>{d.vowifi?.ims || d.status?.label || t('Not connected')}</b></div><div className="u-detail"><span>{t('Country exit')}</span><b className="u-proxy-node-text"><ProxyNodeName text={exitNodeLabel(d, t)} /></b></div><div className="u-detail"><span>{t('Data channel rekey')}</span><b>{(d.vowifi?.rekey_minutes ?? 30) === 0 ? t(d.vowifi?.accept_epdg_rekey ? 'Initiated by carrier' : 'Off') : `${d.vowifi?.rekey_minutes ?? 30} ${t('minutes')}`}</b></div><div className="u-detail"><span>{t('Control channel rekey')}</span><b>{(d.vowifi?.ike_rekey_minutes ?? 150) === 0 ? t('Off') : `${d.vowifi?.ike_rekey_minutes ?? 150} ${t('minutes')}`}</b></div></div>{!!d.egress?.pinned_node && d.egress.pinned_node !== d.egress.node && !!exitChangeReason(d.egress, t, language) && <p className="u-note u-proxy-node-text"><ProxyNodeName text={exitChangeReason(d.egress, t, language)} /></p>}<p className="u-note">{t('Software support means the technical path is implemented. Actual availability still depends on the SIM plan, carrier, region, modem firmware and device-identity policy.')}</p></div>}
-      {tab==='hardware' && <HardwarePanel device={d} refreshDevices={refreshDevices} showToast={showToast}/>}
+      {tab==='hardware' && <HardwarePanel device={d} refreshDevices={refreshDevices} showToast={showToast} focusImei={focusImei} onSetup={openSetup}/>}
     </section></div>
+}
+
+// The modem's own VoLTE/IMS on the cellular network — separate from the VoWiFi line. Carriers
+// with no circuit-switched fallback on LTE (China Telecom, for one) carry 4G calls and texts
+// only over IMS, so with it off every text fails and callers hear "switched off".
+// Whether cellular call audio can reach the gateway at all. Read-only: answering a cellular call
+// works on most modems, but auto-answer, recording and browser calls need the audio too, and
+// some customised firmware (a DJI EG25-G) connects calls that stay silent in both directions.
+function ModemVoiceAudioPanel({ device }) {
+  const { t } = useI18n()
+  const [voice, setVoice] = useState(null)
+  useEffect(() => {
+    if (device.present === false) return
+    let live = true
+    api.getDeviceVoiceAudio(device.id).then(value => { if (live) setVoice(value) })
+      .catch(e => { if (live) setVoice({ status: 'unknown', reason: e.message }) })
+    return () => { live = false }
+  }, [device.id, device.present])
+  if (!voice) return null
+  const state = voice.status === 'supported' ? 'on' : voice.status === 'unsupported' ? 'unsupported' : 'off'
+  const transports = (voice.transports || []).map(item => t(`voice.transport.${item}`)).join(t('list separator'))
+  return <div className="u-note" style={{ marginTop: 12 }}>
+    <div className="u-capability compact">
+      <div><b>{t('Cellular call audio')}</b>
+        <div className="u-cap-detail">{voice.status === 'supported'
+          ? t('This modem can hand call audio to the gateway ({transports}). Cellular auto-answer and recording are not available yet.', { transports })
+          : t(voice.reason || 'Unknown')}</div>
+        {voice.firmware && <div className="u-cap-detail">{t('Firmware')}: {voice.firmware}</div>}
+      </div>
+      <div className="u-cap-actions"><Badge state={state}>{voice.status === 'supported' ? t('Supported') : voice.status === 'unsupported' ? t('cap.unsupported') : t('Unknown')}</Badge></div>
+    </div>
+  </div>
+}
+
+function ModemImsPanel({ device, showToast }) {
+  const { t } = useI18n()
+  const [ims, setIms] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const load = async () => {
+    try { setIms(await api.getDeviceIms(device.id)) } catch (e) { setIms({ supported: false, reason: e.message }) }
+  }
+  useEffect(() => { if (device.present !== false) load() }, [device.id, device.present])  // eslint-disable-line react-hooks/exhaustive-deps
+  if (!ims) return null
+  const change = async (enabled) => {
+    if (!window.confirm(t('The modem restarts to apply this (about a minute). 4G and any VoWiFi line on this modem reconnect afterwards. Continue?'))) return
+    setBusy(true)
+    try {
+      await api.setDeviceIms(device.id, enabled)
+      showToast?.(t('Modem restarting; the IMS state refreshes in about a minute'))
+      setTimeout(() => { load(); setBusy(false) }, 60000)
+    } catch (e) { showToast?.(`${t('Error')}: ${e.message}`); setBusy(false) }
+  }
+  const state = !ims.supported ? 'unsupported' : ims.registered ? 'on' : ims.enabled ? 'starting' : 'off'
+  const label = !ims.supported ? t('cap.unsupported') : ims.registered ? t('IMS registered')
+    : ims.enabled ? t('Enabled, not registered') : t('cap.off')
+  return <div className="u-note" style={{ marginTop: 16 }}>
+    <div className="u-capability compact">
+      <div><b>{t('Modem VoLTE / IMS')}</b>
+        <div className="u-cap-detail">{ims.supported
+          ? t('Needed for 4G calls and texts on VoLTE-only carriers such as China Telecom. This is the modem\'s own setting, separate from VoWiFi.')
+          : t(ims.reason || 'IMS is not supported')}</div>
+        {ims.supported && ims.active_profile && <div className="u-cap-detail">{t('Carrier profile')}: {ims.active_profile}{ims.auto_select ? ` (${t('automatic')})` : ''}</div>}
+      </div>
+      <div className="u-cap-actions"><Badge state={state}>{label}</Badge>
+        {ims.supported && <button className="btn btn-ghost" disabled={busy} onClick={() => change(!ims.enabled)}>{t(busy ? 'Restarting…' : ims.enabled ? 'Turn off' : 'Turn on')}</button>}</div>
+    </div>
+  </div>
 }
 
 function CountryExitControl({ device, refresh, showToast }) {
@@ -701,6 +948,7 @@ const NOTIFICATION_TEMPLATE_EVENTS = [
   ['incoming_call', 'Incoming call'], ['missed_call', 'Missed call'],
   ['voicemail_received', 'New voicemail'], ['incoming_sms', 'Incoming SMS'],
   ['host_alert', 'Host alert'], ['number_changed', 'Line number changed'],
+  ['line_offline', 'Line offline'], ['line_recovered', 'Line recovered'],
   ['line_unrecoverable', 'Line cannot recover'], ['keepalive_result', 'Number keeping result'],
   ['balance_low', 'Balance low'], ['software_update', 'Software update'],
 ]
@@ -796,14 +1044,16 @@ export function NotificationsPage({ showToast, instances = [] }) {
         <MessageTemplateEditor channel="Telegram" config={tg} onChange={message_templates => setChannel('telegram', { message_templates })} onTest={async event => { try { await api.testTelegram({ ...tg, _test_event: event }); showToast(t('Test succeeded')) } catch (e) { showToast(e.message) } }} />{eventOptions('telegram', tg)}{testButton('telegram', api.testTelegram, tg)}
       </div>
       <div className="card u-panel"><div className="u-card-head"><div><h2>PushPlus</h2><p>{t('Push through the official PushPlus service.')}</p></div><input type="checkbox" className="u-toggle" checked={!!pp.enabled} onChange={e => setChannel('pushplus', { enabled: e.target.checked })} /></div><label>{t('PushPlus token')}</label><input type="password" value={pp.token || ''} onChange={e => setChannel('pushplus', { token: e.target.value })} /><label>{t('Topic code (optional)')}</label><input value={pp.topic || ''} onChange={e => setChannel('pushplus', { topic: e.target.value })} /><div className="u-form-grid"><div><label>{t('Content format')}</label><select value={pp.template || 'html'} onChange={e => setChannel('pushplus', { template: e.target.value })}><option value="html">HTML</option><option value="txt">{t('Plain text')}</option><option value="markdown">Markdown</option><option value="json">JSON</option></select></div><div><label>{t('PushPlus channel')}</label><select value={pp.channel || 'wechat'} onChange={e => setChannel('pushplus', { channel: e.target.value })}><option value="wechat">{t('WeChat')}</option><option value="app">App</option><option value="mail">{t('Email')}</option><option value="webhook">Webhook</option><option value="cp">{t('WeCom')}</option><option value="clawbot">ClawBot</option></select></div></div><MessageTemplateEditor channel="PushPlus" config={pp} onChange={message_templates => setChannel('pushplus', { message_templates })} onTest={async event => { try { await api.testPushPlus({ ...pp, _test_event: event }); showToast(t('Test succeeded')) } catch (e) { showToast(e.message) } }} />{eventOptions('pushplus', pp)}{testButton('pushplus', api.testPushPlus, pp)}</div>
-      <div className="card u-panel"><div className="u-card-head"><div><h2>Feishu / Lark</h2><p>{t('Send to multiple custom bots and route each bot by SIM line.')}</p></div><button type="button" className="btn btn-ghost" onClick={addFeishuChannel}>{t('Add bot')}</button></div>{!!feishuChannels.length && <div className="u-tabs" role="tablist" aria-label="Feishu / Lark bots">{feishuChannels.map(channel => <button type="button" role="tab" aria-selected={channel.id === activeFeishuChannel?.id} key={channel.id} className={channel.id === activeFeishuChannel?.id ? 'active' : ''} onClick={() => setActiveFeishuId(channel.id)}><span className={channel.enabled ? 'u-dot good' : 'u-dot'} />{channel.name || channel.id}</button>)}</div>}{!activeFeishuChannel && <p className="u-muted">{t('No Feishu bots configured')}</p>}{activeFeishuChannel && <section className="u-settings-card" role="tabpanel" key={activeFeishuChannel.id}><div className="u-card-head"><div><h3>{activeFeishuChannel.name || activeFeishuChannel.id}</h3><p><code>{activeFeishuChannel.id}</code></p></div><input type="checkbox" className="u-toggle" checked={!!activeFeishuChannel.enabled} onChange={e => updateFeishuChannel(activeFeishuChannel.id, { enabled: e.target.checked })} /></div><label>{t('Channel name')}</label><input value={activeFeishuChannel.name || ''} maxLength={120} onChange={e => updateFeishuChannel(activeFeishuChannel.id, { name: e.target.value })} /><label>{t('Feishu webhook URL')}</label><input type="url" value={activeFeishuChannel.url || ''} onChange={e => updateFeishuChannel(activeFeishuChannel.id, { url: e.target.value })} placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/…" /><label>{t('Signing secret (optional)')}</label><input type="password" value={activeFeishuChannel.secret || ''} onChange={e => updateFeishuChannel(activeFeishuChannel.id, { secret: e.target.value })} /><p className="u-note">{t('Use the secret only when signature verification is enabled for the custom bot.')}</p><details className="u-event-options"><summary>{t('SIM line routing')}</summary><p className="u-note">{t('No selected lines means this bot receives every line and system event.')}</p><div className="u-inline">{instances.map(instance => <label key={instance.id}><input type="checkbox" className="u-toggle" checked={(activeFeishuChannel.instances || []).map(String).includes(String(instance.id))} onChange={e => toggleFeishuInstance(activeFeishuChannel, instance.id, e.target.checked)} />{instance.name || instance.msisdn || instance.id}</label>)}</div></details><MessageTemplateEditor channel={activeFeishuChannel.name || activeFeishuChannel.id} config={activeFeishuChannel} onChange={message_templates => updateFeishuChannel(activeFeishuChannel.id, { message_templates })} onTest={event => runChannelTest(`feishu:${activeFeishuChannel.id}`, api.testFeishu, { ...activeFeishuChannel, _test_event: event })} />{feishuEventOptions(activeFeishuChannel)}<div className="u-inline">{testButton(`feishu:${activeFeishuChannel.id}`, api.testFeishu, activeFeishuChannel)}<button type="button" className="btn btn-ghost" onClick={() => removeFeishuChannel(activeFeishuChannel.id)}>{t('Delete bot')}</button></div></section>}</div></div>}
+      <div className="card u-panel"><div className="u-card-head"><div><h2>Feishu / Lark</h2><p>{t('Send to multiple custom bots and route each bot by SIM line.')}</p></div><button type="button" className="btn btn-ghost" onClick={addFeishuChannel}>{t('Add bot')}</button></div>{!!feishuChannels.length && <div className="u-tabs" role="tablist" aria-label="Feishu / Lark bots">{feishuChannels.map(channel => <button type="button" role="tab" aria-selected={channel.id === activeFeishuChannel?.id} key={channel.id} className={channel.id === activeFeishuChannel?.id ? 'active' : ''} onClick={() => setActiveFeishuId(channel.id)}><span className={channel.enabled ? 'u-dot good' : 'u-dot'} />{channel.name || channel.id}</button>)}</div>}{!activeFeishuChannel && <p className="u-muted">{t('No Feishu bots configured')}</p>}{activeFeishuChannel && <section className="u-settings-card" role="tabpanel" key={activeFeishuChannel.id}><div className="u-card-head"><div><h3>{activeFeishuChannel.name || activeFeishuChannel.id}</h3><p><code>{activeFeishuChannel.id}</code></p></div><input type="checkbox" className="u-toggle" checked={!!activeFeishuChannel.enabled} onChange={e => updateFeishuChannel(activeFeishuChannel.id, { enabled: e.target.checked })} /></div><label>{t('Channel name')}</label><input value={activeFeishuChannel.name || ''} maxLength={120} onChange={e => updateFeishuChannel(activeFeishuChannel.id, { name: e.target.value })} /><label>{t('Feishu webhook URL')}</label><input type="url" value={activeFeishuChannel.url || ''} onChange={e => updateFeishuChannel(activeFeishuChannel.id, { url: e.target.value })} placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/…" /><label>{t('Signing secret (optional)')}</label><input type="password" value={activeFeishuChannel.secret || ''} onChange={e => updateFeishuChannel(activeFeishuChannel.id, { secret: e.target.value })} /><p className="u-note">{t('Use the secret only when signature verification is enabled for the custom bot.')}</p><details className="u-event-options"><summary>{t('SIM line routing')}</summary><p className="u-note">{t('No selected lines means this bot receives every line and system event.')}</p><div className="u-inline">{instances.map(instance => <label key={instance.id}><input type="checkbox" className="u-toggle" checked={(activeFeishuChannel.instances || []).map(String).includes(String(instance.id))} onChange={e => toggleFeishuInstance(activeFeishuChannel, instance.id, e.target.checked)} />{instance.name || instance.msisdn || instance.id}</label>)}</div></details><MessageTemplateEditor channel={activeFeishuChannel.name || activeFeishuChannel.id} config={activeFeishuChannel} onChange={message_templates => updateFeishuChannel(activeFeishuChannel.id, { message_templates })} onTest={event => runChannelTest(`feishu:${activeFeishuChannel.id}`, api.testFeishu, { ...activeFeishuChannel, _test_event: event })} />{feishuEventOptions(activeFeishuChannel)}<div className="u-inline">{testButton(`feishu:${activeFeishuChannel.id}`, api.testFeishu, activeFeishuChannel)}<button type="button" className="btn btn-ghost" onClick={() => removeFeishuChannel(activeFeishuChannel.id)}>{t('Delete bot')}</button></div></section>}</div>
+      <div className="card u-panel"><div className="u-card-head"><div><h2>{t('Line offline alert')}</h2><p>{t('Sent when an enabled line stays off the network this long, and again when it comes back. Short drops are left to automatic recovery.')}</p></div></div><label>{t('Notify after (minutes)')}</label><input type="number" min="1" max="1440" value={s.line_offline_notify_minutes ?? 10} onChange={e => setS(x => ({ ...x, line_offline_notify_minutes: +e.target.value }))} /></div>
+    </div>}
     {tab === 'delivery' && <div className="card u-panel"><div className="u-card-head"><div><h2>{t('Delivery log')}</h2><p>{t('Failed deliveries retry automatically up to three times.')}</p></div><div className="u-inline"><button className="btn btn-ghost" disabled={deliveriesLoading} onClick={loadDeliveries}>{t(deliveriesLoading ? 'Loading…' : 'Refresh')}</button><button className="btn btn-ghost" onClick={async () => { await api.clearNotificationDeliveries(); loadDeliveries() }}>{t('Clear')}</button></div></div>{!deliveries && <p className={deliveriesError ? 'u-error' : 'u-muted'}>{t(deliveriesError ? 'Loading failed' : 'Loading')}{!deliveriesError && '…'}</p>}{deliveries?.pending.map(row => <div className="u-detail" key={row.id}><span>{row.channel} · {row.event}</span><b>{t('Retrying')} ({row.attempts}/3)</b></div>)}{deliveries?.history.map(row => <div className="u-detail" key={row.id}><span>{new Date(row.finished_at * 1000).toLocaleString()} · {row.channel} · {row.event}</span><b>{row.status} · {row.attempts}</b></div>)}{deliveries && !deliveries.pending.length && !deliveries.history.length && <p className="u-muted">{t('No delivery records')}</p>}</div>}
     {tab !== 'delivery' && <button className="btn btn-primary" onClick={save}>{t('Save')}</button>}
   </div>
 }
 
 export function SystemPage({ showToast, openUpdateDialog }) {
-  const { t, language, setLanguage } = useI18n(); const [s, setS] = useState(null); const [loadError, setLoadError] = useState(false); const [tab, setTab] = useState('general'); const [status, setStatus] = useState(null); const [statusLoaded, setStatusLoaded] = useState(false); const [statusError, setStatusError] = useState(false); const [update,setUpdate]=useState(null); const [releaseChoices,setReleaseChoices]=useState([]); const [selectedRelease,setSelectedRelease]=useState(''); const [checking,setChecking]=useState(false); const [passwordForm,setPasswordForm]=useState({current:'',next:'',confirm:''}); const [restarting,setRestarting]=useState(null); const [maintenanceBusy,setMaintenanceBusy]=useState('')
+  const { t, language, setLanguage } = useI18n(); const [s, setS] = useState(null); const [loadError, setLoadError] = useState(false); const [tab, setTab] = useState('general'); const [status, setStatus] = useState(null); const [statusLoaded, setStatusLoaded] = useState(false); const [statusError, setStatusError] = useState(false); const [update,setUpdate]=useState(null); const [releaseChoices,setReleaseChoices]=useState([]); const [selectedRelease,setSelectedRelease]=useState(''); const [checking,setChecking]=useState(false); const [passwordForm,setPasswordForm]=useState({current:'',next:'',confirm:''}); const [restarting,setRestarting]=useState(null); const [maintenanceBusy,setMaintenanceBusy]=useState(''); const [authClients,setAuthClients]=useState(null); const [authClientsError,setAuthClientsError]=useState(false)
   const loadStatus = () => api.systemStatus().then(value => { setStatus(value); setStatusError(false) }).catch(() => setStatusError(true)).finally(() => setStatusLoaded(true))
   useEffect(() => { api.settings().then(value => { setS(value); setLoadError(false) }).catch(() => setLoadError(true)); loadStatus() }, [])
   const loadReleases = async (force = false) => {
@@ -843,10 +1093,13 @@ export function SystemPage({ showToast, openUpdateDialog }) {
     const timer = setTimeout(tick, 2000)
     return () => { stop = true; clearTimeout(timer) }
   }, [restarting, showToast, t])
+  const loadAuthClients=()=>api.authClients().then(value=>{setAuthClients(value.clients||[]);setAuthClientsError(false)}).catch(()=>setAuthClientsError(true))
+  useEffect(()=>{if(tab==='security')loadAuthClients()},[tab])
   if (!s || !statusLoaded) return <p className={loadError || statusError ? 'u-error' : ''}>{t(loadError || statusError ? 'Loading failed' : 'Loading')}{!loadError && !statusError && '…'}</p>
   const tabs = [['general', t('General')], ['web', t('Web access')], ['voice', t('Calls & VoWiFi')], ['security', t('Security')], ['backup', t('Backup & updates')], ['maintenance', t('Maintenance')]]
   const buildCacheReclaimable = status?.host?.project_storage?.build_cache_reclaimable_bytes
   const oldImagesReclaimable = status?.host?.project_storage?.mdd_old_images_reclaimable_bytes
+  const hostRestartAvailable = status?.deployment?.host_restart_available !== false
   const save = async () => { try { const saved = await api.saveSettings(s); setS(saved); showToast(t('Saved')) } catch (e) { showToast(e.message) } }
   const action = async name => { try { const result = name === 'backup' ? await api.createBackup() : await api.maintenance(name); showToast(name === 'backup' && result.missing_attachments ? t('Backup created, but {count} attachment(s) were already missing', { count: result.missing_attachments }) : result.ok ? t('Operation completed') : t('Operation completed with errors')); loadStatus() } catch (e) { showToast(e.message) } }
   const pruneBuildCache = async () => {
@@ -880,6 +1133,7 @@ export function SystemPage({ showToast, openUpdateDialog }) {
   const chosenRelease = releaseChoices.find(item => item.latest === selectedRelease)
   const lastUpdateCheck = update?.last_check_at ? new Date(update.last_check_at * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US', { hour12: false }) : ''
   const changePassword=async()=>{if(passwordForm.next!==passwordForm.confirm){showToast(t('Passwords do not match'));return}try{await api.authPassword(passwordForm.current,passwordForm.next);window.location.reload()}catch(e){showToast(e.message)}}
+  const revokeAuthClient=async(id)=>{if(!window.confirm(t('Sign this app out?')))return;try{await api.revokeAuthClient(id);loadAuthClients()}catch(e){showToast(e.message)}}
   return <div className="u-page"><div className="u-tabs">{tabs.map(([k, l]) => <button key={k} className={tab === k ? 'active' : ''} onClick={() => setTab(k)}>{l}</button>)}</div><div className={['backup', 'maintenance'].includes(tab) ? 'u-settings-shell' : 'card u-panel'}>
     {tab === 'general' && <><h2>{t('General')}</h2><div className="u-form-grid"><div><label>{t('Language')}</label><select value={language} onChange={e => setLanguage(e.target.value)}><option value="zh">中文</option><option value="en">English</option></select></div><div><label>{t('Timezone')}</label><input list="timezones" value={s.timezone || ''} onChange={e => setS({ ...s, timezone: e.target.value })} /><datalist id="timezones"><option>Asia/Shanghai</option><option>Europe/London</option><option>America/New_York</option><option>America/Los_Angeles</option><option>Asia/Tokyo</option><option>UTC</option></datalist></div></div><h3>{t('New device defaults')}</h3><label><input type="checkbox" className="u-toggle" checked={!!s.device_defaults?.cellular_enabled} onChange={e => setS({ ...s, device_defaults: { ...s.device_defaults, cellular_enabled: e.target.checked } })} />{t('Enable 4G for newly detected modems')}</label><label><input type="checkbox" className="u-toggle" checked={s.device_defaults?.vowifi_enabled !== false} onChange={e => setS({ ...s, device_defaults: { ...s.device_defaults, vowifi_enabled: e.target.checked } })} />{t('Enable VoWiFi for newly detected modems')}</label><h3>{t('Hardware')}</h3><label><input type="checkbox" className="u-toggle" checked={s.hardware?.modem_backend === 'serial'} onChange={e => {
       const serial = e.target.checked
@@ -887,7 +1141,7 @@ export function SystemPage({ showToast, openUpdateDialog }) {
       setS({ ...s, hardware: { ...s.hardware, modem_backend: serial ? 'serial' : 'auto' } })
     }} />{t('VoWiFi-only mode (do not run ModemManager)')}</label><p className="u-hint">{t('serialModeHint')}</p></>}
     {tab === 'web' && <><h2>{t('Web access')}</h2><label><input type="checkbox" className="u-toggle" checked={!!s.tls?.self_signed} onChange={e => setS({ ...s, tls: { ...s.tls, self_signed: e.target.checked } })} />{t('Use self-signed certificate')}</label><div className="u-form-grid"><div><label>{t('Bind address')}</label><input value={s.bind || ''} onChange={e => setS({ ...s, bind: e.target.value })} /></div><div><label>{t('HTTPS port')}</label><input type="number" value={s.http_port || 8443} onChange={e => setS({ ...s, http_port: +e.target.value })} /></div><div><label>{t('Domain')}</label><input value={s.tls?.domain || ''} onChange={e => setS({ ...s, tls: { ...s.tls, domain: e.target.value } })} /></div><div><label>{t('Certificate path')}</label><input value={s.tls?.cert_path || ''} onChange={e => setS({ ...s, tls: { ...s.tls, cert_path: e.target.value } })} /></div><div><label>{t('Private key path')}</label><input value={s.tls?.key_path || ''} onChange={e => setS({ ...s, tls: { ...s.tls, key_path: e.target.value } })} /></div></div></>}
-    {tab === 'voice' && <><h2>{t('Calls & VoWiFi')}</h2><div className="u-form-grid"><div><label>{t('Ring timeout (seconds)')}</label><input type="number" value={s.ring_timeout ?? 35} onChange={e => setS({ ...s, ring_timeout: +e.target.value })} /></div><div><label>{t('Max retries')}</label><input type="number" value={s.retry?.max ?? 3} onChange={e => setS({ ...s, retry: { ...s.retry, max: +e.target.value } })} /></div><div><label>{t('Seconds per attempt')}</label><input type="number" value={s.retry?.interval ?? 30} onChange={e => setS({ ...s, retry: { ...s.retry, interval: +e.target.value } })} /></div><div><label>{t('Data channel rekey interval (minutes, 0 = not initiated by the gateway)')}</label><input type="number" value={s.rekey?.minutes ?? 30} onChange={e => setS({ ...s, rekey: { ...s.rekey, minutes: +e.target.value } })} /></div><div><label>{t('Control channel rekey interval (minutes, 0 = off)')}</label><input type="number" value={s.rekey?.ike_minutes ?? 150} onChange={e => setS({ ...s, rekey: { ...s.rekey, ike_minutes: +e.target.value } })} /></div></div>
+    {tab === 'voice' && <><h2>{t('Calls & VoWiFi')}</h2><MediaModePanel /><div className="u-form-grid"><div><label>{t('Ring timeout (seconds)')}</label><input type="number" value={s.ring_timeout ?? 35} onChange={e => setS({ ...s, ring_timeout: +e.target.value })} /></div><div><label>{t('Max retries')}</label><input type="number" value={s.retry?.max ?? 3} onChange={e => setS({ ...s, retry: { ...s.retry, max: +e.target.value } })} /></div><div><label>{t('Seconds per attempt')}</label><input type="number" value={s.retry?.interval ?? 30} onChange={e => setS({ ...s, retry: { ...s.retry, interval: +e.target.value } })} /></div><div><label>{t('Data channel rekey interval (minutes, 0 = not initiated by the gateway)')}</label><input type="number" value={s.rekey?.minutes ?? 30} onChange={e => setS({ ...s, rekey: { ...s.rekey, minutes: +e.target.value } })} /></div><div><label>{t('Control channel rekey interval (minutes, 0 = off)')}</label><input type="number" value={s.rekey?.ike_minutes ?? 150} onChange={e => setS({ ...s, rekey: { ...s.rekey, ike_minutes: +e.target.value } })} /></div></div>
       <p className="u-hint" style={{ margin: '4px 0 0' }}>{t('Some carriers silently expire a VoWiFi session on a fixed clock (observed: ~2h50m). The control channel (IKE) rekey renews the session before that clock fires; keep it below the shortest carrier interval. 0 disables it.')}</p>
       <h3 style={{ marginBottom: 4 }}>{t('Voicemail')}</h3>
       <p className="u-hint" style={{ margin: '0 0 8px' }}>{t('Record a message when an incoming call goes unanswered — including when no browser is open. Recordings stay on the gateway and are played from the call log.')}</p>
@@ -897,7 +1151,7 @@ export function SystemPage({ showToast, openUpdateDialog }) {
         <div><label>{t('Maximum message length (seconds)')}</label><input type="number" min="30" max="300" value={s.vm_max_seconds ?? 120} onChange={e => setS({ ...s, vm_max_seconds: +e.target.value })} /></div>
       </div>
       <p className="u-hint">{t('A call you decline on the softphone is never recorded. Changing these restarts the engine of each running line, which reconnects briefly.')}</p></>}
-    {tab === 'security' && <><h2>{t('Security')}</h2><div className="u-detail"><span>{t('HTTPS')}</span><b>{status?.security?.https ? t('Enabled') : t('Disabled')}</b></div><div className="u-detail"><span>{t('Certificate mode')}</span><b>{status?.security?.certificate_mode ? t(status.security.certificate_mode) : '—'}</b></div><h3>{t('Change administrator password')}</h3><div className="u-form-grid"><div><label>{t('Current password')}</label><input type="password" autoComplete="current-password" value={passwordForm.current} onChange={e=>setPasswordForm({...passwordForm,current:e.target.value})}/></div><div><label>{t('New password (at least 10 characters)')}</label><input type="password" autoComplete="new-password" minLength="10" value={passwordForm.next} onChange={e=>setPasswordForm({...passwordForm,next:e.target.value})}/></div><div><label>{t('Confirm password')}</label><input type="password" autoComplete="new-password" minLength="10" value={passwordForm.confirm} onChange={e=>setPasswordForm({...passwordForm,confirm:e.target.value})}/></div></div><button className="btn btn-ghost" disabled={!passwordForm.current||passwordForm.next.length<10||!passwordForm.confirm} onClick={changePassword}>{t('Change password')}</button><label><input type="checkbox" className="u-toggle" checked={s.security?.audit_enabled !== false} onChange={e => setS({ ...s, security: { ...s.security, audit_enabled: e.target.checked } })} />{t('Record administrative operations')}</label><label>{t('Trusted reverse proxies (comma-separated)')}</label><input value={(s.security?.trusted_proxies || []).join(', ')} onChange={e => setS({ ...s, security: { ...s.security, trusted_proxies: e.target.value.split(',').map(x => x.trim()).filter(Boolean) } })} /></>}
+    {tab === 'security' && <><h2>{t('Security')}</h2><div className="u-detail"><span>{t('HTTPS')}</span><b>{status?.security?.https ? t('Enabled') : t('Disabled')}</b></div><div className="u-detail"><span>{t('Certificate mode')}</span><b>{status?.security?.certificate_mode ? t(status.security.certificate_mode) : '—'}</b></div><h3>{t('Change administrator password')}</h3><div className="u-form-grid"><div><label>{t('Current password')}</label><input type="password" autoComplete="current-password" value={passwordForm.current} onChange={e=>setPasswordForm({...passwordForm,current:e.target.value})}/></div><div><label>{t('New password (at least 10 characters)')}</label><input type="password" autoComplete="new-password" minLength="10" value={passwordForm.next} onChange={e=>setPasswordForm({...passwordForm,next:e.target.value})}/></div><div><label>{t('Confirm password')}</label><input type="password" autoComplete="new-password" minLength="10" value={passwordForm.confirm} onChange={e=>setPasswordForm({...passwordForm,confirm:e.target.value})}/></div></div><button className="btn btn-ghost" disabled={!passwordForm.current||passwordForm.next.length<10||!passwordForm.confirm} onClick={changePassword}>{t('Change password')}</button><p className="u-hint">{t('Changing the password also signs out every app.')}</p><label><input type="checkbox" className="u-toggle" checked={s.security?.audit_enabled !== false} onChange={e => setS({ ...s, security: { ...s.security, audit_enabled: e.target.checked } })} />{t('Record administrative operations')}</label><label>{t('Trusted reverse proxies (comma-separated)')}</label><input value={(s.security?.trusted_proxies || []).join(', ')} onChange={e => setS({ ...s, security: { ...s.security, trusted_proxies: e.target.value.split(',').map(x => x.trim()).filter(Boolean) } })} /><h3>{t('Signed-in apps')}</h3><p className="u-hint">{t('Apps signed in with the administrator account. Revoking one signs it out at once; changing the password signs out all of them.')}</p>{!authClients && <p className={authClientsError?'u-error':'u-muted'}>{t(authClientsError?'Loading failed':'Loading')}{!authClientsError&&'…'}</p>}{authClients && !authClients.length && <p className="u-muted">{t('No apps are signed in.')}</p>}{authClients?.map(c=><div className="u-detail" key={c.id}><div><span>{c.name}</span><b>{[c.platform,c.app_version].filter(Boolean).join(' · ')}</b> · <small>{t('Last used')}: {new Date(c.last_seen*1000).toLocaleString()}</small></div><button className="btn btn-danger-outline" onClick={()=>revokeAuthClient(c.id)}>{t('Sign out')}</button></div>)}</>}
     {tab === 'backup' && <div className="u-settings-stack">
       <div className="u-settings-grid">
         <section className="card u-panel u-settings-card">
@@ -942,8 +1196,8 @@ export function SystemPage({ showToast, openUpdateDialog }) {
       <section className="card u-panel u-settings-card"><div className="u-settings-card-head"><div><h2>{t('Restart')}</h2><p>{t('Ordered by how much they interrupt: the control plane can be restarted without touching a call, the host cannot.')}</p></div></div><div className="u-action-list">
           <button className="btn btn-ghost" disabled={!!restarting} onClick={() => restart('control')}>{t('Restart the control plane')}</button>
           <button className="btn btn-ghost" disabled={!!restarting} onClick={() => restart('services')}>{t('Restart all gateway services')}</button>
-          <button className="btn btn-ghost" disabled={!!restarting} onClick={() => restart('host')}>{t('Restart the host')}</button>
-        </div>{restarting && <p className="u-note u-restart-note">{t(`restart.waiting.${restarting}`)}</p>}</section>
+          <button className="btn btn-ghost" disabled={!!restarting || !hostRestartAvailable} onClick={() => restart('host')}>{t('Restart the host')}</button>
+        </div>{!hostRestartAvailable && <p className="u-hint">{t('Host restart is unavailable in container mode. Restart the NAS from its own administration interface.')}</p>}{restarting && <p className="u-note u-restart-note">{t(`restart.waiting.${restarting}`)}</p>}</section>
     </div>}
   </div>{!['backup', 'maintenance'].includes(tab) && <button className="btn btn-primary" onClick={save}>{t('Save')}</button>}</div>
 }

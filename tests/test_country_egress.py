@@ -749,6 +749,47 @@ class ManagedReselectTests(unittest.TestCase):
                 self.assertIs(app.singbox, replacement)
                 self.assertEqual(app.last_proxy_config, updated)
 
+    def test_the_exit_tun_is_taken_back_out_of_the_host_dns(self):
+        """sing-tun registers every tun with systemd-resolved as the resolver for "~.",
+        which took all DNS away from an Ubuntu host as soon as an exit was enabled."""
+        with tempfile.TemporaryDirectory() as temp:
+            app = self._orchestrator(temp, {})
+            config, _states = _build(app, {})
+            app.dry_run = False
+            process = Mock()
+            process.poll.return_value = None
+            registered = {"done": False}
+            calls = []
+
+            def fake_run(args, **kwargs):
+                calls.append(args)
+                shown = "Link 22 (mdd-us): ~." if registered["done"] else "Link 22 (mdd-us):"
+                return SimpleNamespace(returncode=0, stdout=shown, stderr="")
+
+            with patch("host.mdd_orchestrator.shutil.which",
+                       side_effect=lambda name: f"/usr/bin/{name}"), \
+                    patch("host.mdd_orchestrator.run", side_effect=fake_run), \
+                    patch("host.mdd_orchestrator.time.sleep"), \
+                    patch("host.mdd_orchestrator.subprocess.Popen", return_value=process):
+                app.apply_singbox(config)
+                self.assertEqual(app.tun_dns_pending, {"mdd-us"})
+                # The registration is asynchronous: not there yet, so nothing is reverted.
+                app.release_tun_dns()
+                self.assertNotIn(["/usr/bin/resolvectl", "revert", "mdd-us"], calls)
+                self.assertEqual(app.tun_dns_pending, {"mdd-us"})
+                registered["done"] = True
+                app.release_tun_dns()
+                self.assertIn(["/usr/bin/resolvectl", "revert", "mdd-us"], calls)
+                self.assertEqual(app.tun_dns_pending, set())
+
+            # A host without systemd-resolved never got the registration; nothing is run.
+            app.tun_dns_pending = {"mdd-us"}
+            with patch("host.mdd_orchestrator.shutil.which", return_value=None), \
+                    patch("host.mdd_orchestrator.run") as run:
+                app.release_tun_dns()
+            run.assert_not_called()
+            self.assertEqual(app.tun_dns_pending, set())
+
     def test_a_node_that_did_not_survive_the_rewrite_starts_over(self):
         with tempfile.TemporaryDirectory() as temp:
             app = self._orchestrator(temp, {"exit-us-0": 300, "exit-us-1": 800})
@@ -917,7 +958,7 @@ class IdleBackoffTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             app = self._app(temp)
             # None of them exist yet on a fresh install.
-            self.assertEqual(len(app._input_mtimes()), 7)
+            self.assertEqual(len(app._input_mtimes()), 8)
 
 
 class HotplugResponsivenessTests(unittest.TestCase):
@@ -937,7 +978,7 @@ class HotplugResponsivenessTests(unittest.TestCase):
             self.assertNotEqual(two_devices, three_devices,
                                 "a newly plugged modem must end the backoff")
             # A platform without a USB tree still returns a stable shape.
-            self.assertEqual(len(app._input_mtimes()), 7)
+            self.assertEqual(len(app._input_mtimes()), 8)
 
 
 class PastedNodeFidelityTests(unittest.TestCase):
@@ -1117,6 +1158,14 @@ class UdpProbeTargetTests(unittest.TestCase):
             self.assertEqual(egress.test_udp_proxy("127.0.0.1", 1080), 42)
         self.assertEqual(calls[0], ("dns", "1.1.1.1", 53))
         self.assertEqual(calls[-1], ("dns", "9.9.9.9", 53))
+
+    def test_epdg_resolution_uses_the_selected_socks_udp_path(self):
+        with patch.object(egress, "_udp_probe_once", return_value="198.51.100.25") as probe:
+            address = egress.resolve_ipv4_via_socks(
+                "socks5://mdd-egress:22157", "epdg.example.net")
+        self.assertEqual(address, "198.51.100.25")
+        self.assertEqual(probe.call_args.args[2],
+                         ("resolve", "1.1.1.1", 53, "epdg.example.net"))
 
     def test_every_probe_failing_names_each_one(self):
         with patch.object(egress, "_udp_probe_once",

@@ -32,3 +32,4 @@ id_ed25519*
 
 # debug captures
 *.pcap
+.driver-cache/

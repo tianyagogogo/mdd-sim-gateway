@@ -2,6 +2,15 @@
 
 Open an issue before a large behavior or hardware change. Keep device operations fail-closed, never add real subscriber data to fixtures, and preserve upstream attribution.
 
+## NAS compatibility reports
+
+Use the **NAS hardware compatibility** Issue form for a new model or system build. After the report
+is reproduced or clearly marked as unverified, add one record under `drivers/catalog/` and run
+`python3 tools/validate_nas_catalog.py`. Follow `drivers/README.md`: remove all device and subscriber
+identifiers, and do not submit third-party kernel binaries in a pull request. A compatibility report
+only becomes `release-ready` after maintainers reproduce the build and publish a checksummed driver
+asset from an auditable source and toolchain.
+
 ## Branches
 
 `develop` is the integration branch. Create a focused `feat/*` or `fix/*` branch from its latest

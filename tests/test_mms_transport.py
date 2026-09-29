@@ -233,6 +233,44 @@ class ModemSocketTests(unittest.TestCase):
         with self.assertRaises(t.MmsTransportError):
             self.client(fake).request("GET", "http://mmsc.example.test:8002/?id=1")
 
+    def test_a_connection_that_never_opens_sent_nothing(self):
+        fake = FakeQuectel(http_reply(b"ok"))
+        original = fake.handle
+
+        def refusing(command, timeout):
+            if command.startswith("AT+QIOPEN="):
+                return False, "ERROR"
+            return original(command, timeout)
+
+        fake.handle = refusing
+        with self.assertRaises(t.MmsTransportError) as raised:
+            self.client(fake).request("GET", "http://mmsc.example.test:8002/?id=1")
+        self.assertTrue(raised.exception.unsent)
+
+    def test_a_connection_that_stays_closed_gives_up_long_before_the_upload_deadline(self):
+        fake = FakeQuectel(http_reply(b"ok"))
+        original = fake.handle
+
+        def never_open(command, timeout):
+            if command.startswith("AT+QISTATE="):
+                return True, ""
+            return original(command, timeout)
+
+        fake.handle = never_open
+        now = [0.0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        client = t.ModemSocketHttp(
+            t.ModemCommand("/org/freedesktop/ModemManager1/Modem/0", fake), SETTINGS,
+            sleep=sleep, clock=lambda: now[0])
+        with self.assertRaisesRegex(t.MmsTransportError, "timed out connecting") as raised:
+            client.request("POST", "http://mmsc.example.test:8002/", body=b"x" * 700,
+                           timeout=3000.0)
+        self.assertTrue(raised.exception.unsent)
+        self.assertLessEqual(now[0], t.ModemSocketHttp.CONNECT_TIMEOUT + 1)
+
     def test_unsupported_modem_falls_back_to_host_in_auto(self):
         fake = FakeQuectel(b"", supported=False)
         client = t.client_for(SETTINGS, "/org/freedesktop/ModemManager1/Modem/0", runner=fake)
@@ -303,6 +341,47 @@ class SerialChannelTests(unittest.TestCase):
         self.assertIn('AT+QICFG="dataformat",0,1', modem.commands)
         self.assertFalse(any(c.startswith("AT+QISENDEX") for c in modem.commands))
         self.assertTrue(ports[0].closed, "the port is released after each exchange")
+
+    def upload_failing_at(self, failing_chunk):
+        """A 40 KB upload whose `failing_chunk`-th AT+QISEND (from 0) the modem answers with
+        SEND FAIL, as its MMSC socket occasionally does part way through."""
+        modem = FakeQuectel(http_reply(b"ok"))
+        port = FakeSerialPort(modem)
+        chunks = []
+        original = port.write
+
+        def write(data):
+            if port.pending is not None:
+                chunks.append(data)
+                if len(chunks) - 1 == failing_chunk:
+                    port.pending = None
+                    port.out += b"\r\nSEND FAIL\r\n"
+                    return
+            original(data)
+
+        port.write = write
+        channel = t.SerialAtChannel("/dev/ttyFAKE", serial_factory=lambda _p: port)
+        client = t.ModemSocketHttp(channel, SETTINGS, sleep=lambda _s: None)
+        try:
+            client.request("POST", "http://mmsc.example.test:8002/", body=b"\x00\xff" * 20_000)
+        except t.MmsTransportError as exc:
+            return exc, len(chunks)
+        return None, len(chunks)
+
+    def test_a_chunk_the_modem_refuses_is_reported_with_its_answer_and_offset(self):
+        error, _ = self.upload_failing_at(2)
+        self.assertIsNotNone(error)
+        self.assertIn("modem answered: SEND FAIL", str(error))
+        self.assertIn(f"at byte {2 * t.SerialAtChannel.CHUNK} of ", str(error))
+        self.assertTrue(error.unsent, "the MMSC has seen only part of the request")
+        self.assertFalse(error.after_send)
+
+    def test_a_refused_last_chunk_may_still_have_reached_the_mmsc(self):
+        nothing, total = self.upload_failing_at(None)    # count the chunks of a clean upload
+        self.assertIsNone(nothing)
+        error, _ = self.upload_failing_at(total - 1)
+        self.assertIn(f"at byte {(total - 1) * t.SerialAtChannel.CHUNK} of ", str(error))
+        self.assertFalse(error.unsent)
 
     def test_port_discovery_takes_an_ignored_at_port_only(self):
         def runner(args, **kwargs):
@@ -462,6 +541,10 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(store.get_message(out["id"])["status"], "unknown")
 
 
+# 40 frames (0.8 s) of 12.2 kbit/s AMR: 1286 bytes that no converter can shrink.
+AMR = b"#!AMR\n" + (bytes([7 << 3 | 0x04]) + b"\x00" * 31) * 40
+
+
 class SendTests(DownloadTests):
     def compose(self, text="hello", attachments=None):
         return mms.create_outgoing("1", ["+447700900123"], text,
@@ -477,8 +560,9 @@ class SendTests(DownloadTests):
                                                                       [], settings))
         self.assertIn("cannot be sent", mms.validate_outgoing(
             ["+447700900123"], "", [{"content_type": "text/html", "data": b"x"}], settings))
+        # Sound cannot be made smaller, so it counts as it is.
         self.assertIn("allows 1 KB", mms.validate_outgoing(
-            ["+447700900123"], "", [{"content_type": "image/png", "data": b"x" * 2000}],
+            ["+447700900123"], "", [{"content_type": "audio/amr", "data": AMR * 2}],
             settings))
         self.assertIsNone(mms.validate_outgoing(["+447700900123", "a@example.test"], "hi", [],
                                                 settings))
@@ -486,11 +570,10 @@ class SendTests(DownloadTests):
                          ["+447700900123", "+447700900124"])
 
     def test_the_limit_applies_to_the_packaged_message(self):
-        jpeg = {"name": "p.jpg", "content_type": "image/jpeg",
-                "data": b"\xff\xd8\xff" + b"x" * 997}
+        jpeg = {"name": "memo.amr", "content_type": "audio/amr", "data": AMR}
         request = mms.build_request("0" * 20, ["+447700900123"], "",
                                     mms._compose_parts("hi", [jpeg]))
-        self.assertGreater(len(request), 1002, "SMIL and headers take room of their own")
+        self.assertGreater(len(request), len(AMR) + 2, "SMIL and headers take room of their own")
         exact = {"max_size": len(request)}
         self.assertIsNone(mms.validate_outgoing(["+447700900123"], "hi", [jpeg], exact))
         self.assertIn("once packaged", mms.validate_outgoing(
@@ -557,6 +640,37 @@ class SendTests(DownloadTests):
         result = mms.send(self.inst, rec["id"], client=FakeClient([lost]))
         self.assertEqual(result["status"], "unknown")
         self.assertEqual(store.get_message(rec["id"])["status"], "unknown")
+
+    CONF_OK = bytes([0x8C, 0x81, 0x98]) + m.write_text_string("x") + b"\x8D\x92" + \
+        bytes([0x92, 0x80])
+
+    def send_through(self, *responses):
+        rec = self.compose()
+        client, waits = FakeClient(responses), []
+        result = mms.send(self.inst, rec["id"], client=client, sleep=waits.append)
+        return result, len(client.requests), waits, store.get_message(rec["id"])
+
+    def test_an_upload_cut_short_is_submitted_again(self):
+        cut = t.MmsTransportError("the modem could not send", unsent=True)
+        result, attempts, waits, stored = self.send_through(cut, t.HttpResponse(200, {},
+                                                                                self.CONF_OK))
+        self.assertEqual((result["status"], attempts, waits), ("sent", 2, [3]))
+        self.assertEqual(stored["status"], "sent")
+
+    def test_resubmission_gives_up_after_its_delays(self):
+        cut = t.MmsTransportError("the modem could not send", unsent=True)
+        result, attempts, waits, stored = self.send_through(cut, cut, cut)
+        self.assertEqual((result["status"], attempts), ("failed", 3))
+        self.assertEqual(waits, list(mms.SEND_RETRY_DELAYS))
+        self.assertEqual(stored["status"], "failed")
+
+    def test_a_request_that_may_have_arrived_whole_is_never_submitted_again(self):
+        for error, status in (
+                (t.MmsTransportError("last chunk refused"), "failed"),
+                (t.MmsTransportError("no answer", after_send=True, unsent=True), "unknown"),
+                (t.MmsTransportError("no APN", retryable=False, unsent=True), "failed")):
+            result, attempts, waits, _ = self.send_through(error)
+            self.assertEqual((result["status"], attempts, waits), (status, 1, []), error)
 
 
 class ExchangeLockTests(unittest.TestCase):

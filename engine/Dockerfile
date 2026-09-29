@@ -163,12 +163,14 @@ RUN set -eu; \
 # Derive the Fedora runtime package closure from the binary we just built and every Asterisk
 # module we ship. This keeps all codecs and optional modules loadable without carrying compilers,
 # headers or source trees into the final image. Packages needed by the Python tunnel and its shell
-# supervisor are explicit because they are not visible to ldd.
+# supervisor are explicit because they are not visible to ldd. iptables-legacy is the relay-mode
+# media filter on kernels without nf_tables' socket match (Synology DSM's 4.4); nftables already
+# brings the xtables extensions it uses, so it adds only its own tools and libip4tc/libip6tc.
 RUN set -eu; \
     { \
       printf '%s\n' \
         bash coreutils grep hostname iproute net-tools procps-ng \
-        tcpdump bind-utils iputils ca-certificates \
+        tcpdump bind-utils iputils ca-certificates nftables iptables-legacy \
         python3 python3-jinja2 python3-pyscard python3-pysocks python3-requests; \
       { printf '%s\n' /usr/sbin/asterisk; find /usr/lib/asterisk/modules -type f -name '*.so'; } | \
         while IFS= read -r binary; do \
@@ -251,6 +253,7 @@ RUN mkdir -p /var/cache/asterisk /var/log/asterisk /var/spool/asterisk && ldconf
 COPY pin_keeper.py   /usr/local/bin/pin_keeper.py
 COPY ami_usim.py     /usr/local/bin/ami_usim.py
 COPY swu_ike.py      /usr/local/bin/swu_ike.py
+COPY outer_transport.py /usr/local/bin/outer_transport.py
 COPY log_capture.py  /usr/local/bin/log_capture.py
 COPY render.py       /usr/local/bin/render.py
 COPY notify.py       /usr/local/bin/notify.py
@@ -265,6 +268,7 @@ ARG RUNTIME_FP=""
 ARG BASE_FP=""
 ARG MDD_VERSION=""
 LABEL io.mdd-sim-gateway.managed="true" \
+      io.mdd-sim-gateway.egress-transports="socks5" \
       io.mdd-sim-gateway.runtime-fp="${RUNTIME_FP}" \
       io.mdd-sim-gateway.base-fp="${BASE_FP}" \
       org.opencontainers.image.version="${MDD_VERSION}" \

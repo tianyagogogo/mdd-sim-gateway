@@ -12,13 +12,13 @@ import asyncio
 import base64
 import glob
 import hashlib
-import hmac
 import ipaddress
 import json
 import logging
 import os
 import random
 import re
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -29,12 +29,14 @@ import docker
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.responses import JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette import formparsers as starlette_formparsers
 
 from . import config as cfg
 from . import (store, engine, status as status_mod, sim, card, notify_push, lpa, auth,
                estkme, usbreader, egress, device_state, operations, update_check, cellular_sms,
                sysinfo, failover, carrier_id, allowance, cellular_call, sms_pdu, ussd, mms,
-               mms_media, mms_transport, softphone_ws)
+               mms_media, mms_staging, mms_transport, softphone_ws, modem_ims, vowifi_support,
+               modem_voice, gate, line_offline, contacts, media, clients, authz)
 from .version import VERSION
 from .ami import AmiClient
 from .runtime import RuntimeRegistry
@@ -88,6 +90,7 @@ UPDATE_CHECK_INTERVAL_SECONDS = float(os.environ.get("MDD_UPDATE_CHECK_INTERVAL"
 _line_state_written: dict[str, tuple[str, float]] = {}
 _line_registered_written: dict[str, float] = {}   # per-line throttle for the durable
                                                  # "last registered" stamp
+_background_tasks: set[asyncio.Task] = set()
 LINE_REGISTERED_WRITE_INTERVAL_SECONDS = 3600
 
 logging.basicConfig(level=logging.INFO,
@@ -480,6 +483,7 @@ class Hub:
         self.esim_switch_locks: dict[str, asyncio.Lock] = {}
         self.lpa_busy: dict[str, bool] = {}  # readers currently owned by an LPA op
         self.lpa_downloads: dict[str, dict] = {}  # reader_name -> active download handle
+        self.card_rereads: set[str] = set()  # readers with a draft-completing re-read queued
         self.hotplug_starts: set[str] = set()  # debounce duplicate modem VPCD slots
         # When each line last became healthy, so a failure can be attributed. A line that
         # carried IMS for a long time and then broke is not evidence against its exit node.
@@ -490,6 +494,8 @@ class Hub:
         # Shared with the acknowledgement endpoint. The poller owns condition lifecycle;
         # the API only marks currently visible items handled.
         self.host_alert_state: dict | None = None
+        # Per-line outage clock for the offline notification; loaded on the first pass.
+        self.line_offline_state: dict[str, dict] | None = None
 
     def cards_list(self) -> list[dict]:
         """Reader/card entries sorted by current PC/SC index (the UI display order)."""
@@ -594,8 +600,11 @@ class Hub:
     async def broadcast(self, msg: dict):
         dead = []
         for ws in list(self.clients):
+            view = authz.event_for(gate.current(ws), msg)
+            if view is None:
+                continue
             try:
-                await ws.send_json(msg)
+                await ws.send_json(view)
             except Exception:
                 dead.append(ws)
         for ws in dead:
@@ -666,6 +675,16 @@ def _start_engine_checked(inst: dict, settings: dict, dev_mounts: bool = False,
             log.warning("instance %s: correcting modem reader binding before %s start",
                         inst.get("id"), reason)
             inst = cfg.upsert_instance({"id": str(inst["id"]), **binding})
+        # The same for a line on an ordinary reader: its saved USB port may be where the SIM
+        # sat the last time, e.g. an eSIM profile used before in another reader. The engine
+        # then finds no reader there, falls back to an index holding another line's card and
+        # refuses to authenticate -- a retry every minute until someone re-saves the line.
+        reader = {} if binding else _live_reader_binding_for_instance(inst)
+        if reader and any(inst.get(key) != value for key, value in reader.items()):
+            log.warning("instance %s: SIM found in the reader at USB port %s, not %s; "
+                        "rebinding before %s start", inst.get("id"), reader["reader_port"],
+                        inst.get("reader_port") or "(none)", reason)
+            inst = cfg.upsert_instance({"id": str(inst["id"]), **reader})
         # A line follows its SIM; its device identity follows the physical modem/reader
         # currently holding that SIM. Refresh the rendered snapshot on every start.
         inst = _apply_current_hardware_imei(inst)
@@ -844,6 +863,8 @@ async def _on_card_insert(name, idx):
             if inst:
                 info["matched"] = inst["id"]
     hub.cards[name] = info
+    if _draft_needs_card_read(name):
+        asyncio.create_task(_complete_draft_from_card(name))
     log.info("card inserted reader=%s (%s) identity=%s matched=%s", idx, name,
              "available" if info["iccid"] else "unknown", info["matched"])
     if info.get("matched"):
@@ -933,20 +954,22 @@ def _line_auto_start_allowed(inst: dict) -> tuple[bool, str]:
     return True, ""
 
 
-def _auto_promote_card_draft(inst: dict, card_info: dict, cards: list[dict]) -> dict:
-    """Promote a complete auto-created draft, or return it with missing-field hints.
+_DRAFT_FIELD_KEYS = {"IMSI": "imsi", "MCC/MNC": "mcc_mnc", "IMEI": "imei", "SMSC": "smsc",
+                     "SIM PIN": "pin"}
 
-    Hardware identity follows the physical reader/modem; SIM identity follows the ICCID.
-    Keeping this as a synchronous helper makes the promotion rules independently testable.
+
+def _draft_missing(inst: dict, card_info: dict, cards: list[dict]) -> list[str]:
+    """What an auto-created draft still lacks before it can become a line.
+
+    The device page shows this list, so the operator is told what is actually missing. It
+    used to say only that an IMEI was needed. Once the IMEI was saved, a SIM whose SMSC the
+    reader could not read stayed a draft, and the only hint left was a generic "waiting".
     """
-    if inst.get("provisioning_state") != "draft":
-        return inst
-
     imsi = str(card_info.get("imsi") or inst.get("imsi") or "").strip()
     mcc = str(card_info.get("mcc") or inst.get("mcc") or (imsi[:3] if len(imsi) >= 3 else ""))
     mnc = str(card_info.get("mnc") or inst.get("mnc") or "")
     smsc = str(card_info.get("smsc") or inst.get("smsc") or "").strip()
-    imei, hardware_id, _device_type = _hardware_imei_for_card(card_info, cards)
+    imei, _hardware_id, _device_type = _hardware_imei_for_card(card_info, cards)
     missing = []
     if not imsi:
         missing.append("IMSI")
@@ -958,8 +981,109 @@ def _auto_promote_card_draft(inst: dict, card_info: dict, cards: list[dict]) -> 
         missing.append("SMSC")
     if card_info.get("pin_enabled") is True and not inst.get("pin"):
         missing.append("SIM PIN")
+    return missing
+
+
+# Draft fields that only a card read can supply; the rest come from the operator.
+_CARD_READ_FIELDS = {"IMSI", "MCC/MNC", "SMSC"}
+# Seen on an Alcor AK9563: the read at insertion returned no SMSC for a SIM whose EF_SMSP a
+# later read returned without trouble. Retry on a widening schedule, then leave it to the
+# operator, who is shown the missing field and a re-read button.
+_CARD_REREAD_DELAYS = (10, 30, 60, 120, 300)
+
+
+def _merge_card_read(entry: dict, card) -> bool:
+    """Fill what an earlier read of the same card left empty. Returns whether anything did.
+
+    Identity is only ever added, never replaced: a read that fails half way must not erase
+    what a better one found. PIN retry counters are live state and are always refreshed.
+    """
+    if not card.iccid or str(card.iccid) != str(entry.get("iccid") or ""):
+        return False
+    filled = False
+    for key, value in (("imsi", card.imsi), ("mcc", card.mcc), ("mnc", card.mnc),
+                       ("mnc_len", getattr(card, "mnc_len", None)), ("smsc", card.smsc)):
+        if value not in (None, "") and not entry.get(key):
+            entry[key] = value
+            filled = True
+    if filled:
+        entry["carrier_identity"] = entry.get("carrier_identity") or _carrier_identity(card)
+    for key in ("pin_enabled", "pin_tries"):
+        if getattr(card, key, None) is not None:
+            entry[key] = getattr(card, key)
+    return filled
+
+
+async def _reread_card(name: str) -> bool:
+    """Read the card in reader `name` again and merge what the first read missed."""
+    entry = hub.cards.get(name)
+    if not entry or not entry.get("present") or hub.lpa_busy.get(name):
+        return False
+    lock = hub.reader_lock(name)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=0.5)
+    except asyncio.TimeoutError:
+        return False
+    try:
+        card = await asyncio.to_thread(sim.read_card, entry["index"])
+    except Exception as exc:  # noqa: a failed read leaves the cache as it was
+        log.debug("card re-read failed for %s: %r", name, exc)
+        return False
+    finally:
+        lock.release()
+    return _merge_card_read(entry, card)
+
+
+def _draft_needs_card_read(name: str) -> str:
+    """The draft id behind reader `name` if a card read could still complete it, else ''."""
+    entry = hub.cards.get(name) or {}
+    iid = str(entry.get("matched") or "")
+    inst = cfg.get_instance(iid) if iid and entry.get("present") else None
+    if not inst or inst.get("provisioning_state") != "draft":
+        return ""
+    missing = _draft_missing(inst, entry, hub.cards_list())
+    return iid if set(missing) & _CARD_READ_FIELDS else ""
+
+
+async def _complete_draft_from_card(name: str):
+    """Re-read a draft's card on a widening schedule while it lacks card-only fields."""
+    if name in hub.card_rereads:
+        return
+    hub.card_rereads.add(name)
+    try:
+        for delay in _CARD_REREAD_DELAYS:
+            await asyncio.sleep(delay)
+            iid = _draft_needs_card_read(name)
+            if not iid:
+                return
+            if await _reread_card(name) and not _draft_needs_card_read(name):
+                log.info("draft %s: a later card read supplied what the first one missed", iid)
+                asyncio.create_task(_auto_start_hotplugged_line(iid))
+                return
+        if _draft_needs_card_read(name):
+            log.info("draft behind %s still lacks card data after %d re-reads",
+                     name, len(_CARD_REREAD_DELAYS))
+    finally:
+        hub.card_rereads.discard(name)
+
+
+def _auto_promote_card_draft(inst: dict, card_info: dict, cards: list[dict]) -> dict:
+    """Promote a complete auto-created draft, or return it with missing-field hints.
+
+    Hardware identity follows the physical reader/modem; SIM identity follows the ICCID.
+    Keeping this as a synchronous helper makes the promotion rules independently testable.
+    """
+    if inst.get("provisioning_state") != "draft":
+        return inst
+
+    missing = _draft_missing(inst, card_info, cards)
     if missing:
         return {**inst, "auto_provision_missing": missing}
+    imsi = str(card_info.get("imsi") or inst.get("imsi") or "").strip()
+    mcc = str(card_info.get("mcc") or inst.get("mcc") or (imsi[:3] if len(imsi) >= 3 else ""))
+    mnc = str(card_info.get("mnc") or inst.get("mnc") or "")
+    smsc = str(card_info.get("smsc") or inst.get("smsc") or "").strip()
+    imei, hardware_id, _device_type = _hardware_imei_for_card(card_info, cards)
 
     previous_imeisv = str(inst.get("imeisv") or "")
     svn = (previous_imeisv[-2:] if len(previous_imeisv) == 16
@@ -1006,9 +1130,18 @@ def _auto_promote_card_draft(inst: dict, card_info: dict, cards: list[dict]) -> 
             "reader_index": int(card_info.get("index") or inst.get("reader_index") or 0),
             "reader_port": str(card_info.get("reader_port") or inst.get("reader_port") or ""),
         })
+    # A phone hides the Wi-Fi Calling switch for a carrier that does not offer it. Doing the
+    # same here keeps cellular working without a line that can only fail; the device page
+    # says why and the switch still lets the user try.
+    support = vowifi_support.for_instance({"mcc": mcc, "mnc": mnc, "epdg": inst.get("epdg")},
+                                          probe_now=True)
+    if support["status"] == vowifi_support.UNSUPPORTED:
+        update["enabled"] = False
     promoted = cfg.upsert_instance(update, unique_name=generated_name)
     egress.publish()
-    log.info("hotplug draft %s auto-provisioned for MCC %s", inst["id"], mcc)
+    log.info("hotplug draft %s auto-provisioned for MCC %s%s", inst["id"], mcc,
+             f" (VoWiFi left off: {support['source']})"
+             if support["status"] == vowifi_support.UNSUPPORTED else "")
     return promoted
 
 
@@ -1500,6 +1633,107 @@ def _status_poll_delay(instances: list[dict]) -> float:
             else STATUS_POLL_HEALTHY_SECONDS)
 
 
+MEDIA_SUPERVISE_SECONDS = 30
+MEDIA_CONVERGE_SECONDS = 15
+
+
+MEDIA_RETRY_FIRST_SECONDS = 60
+MEDIA_RETRY_MAX_SECONDS = 600
+# iid -> {"at": monotonic time of the next attempt, "failures": consecutive failures}
+_media_retry: dict[str, dict] = {}
+
+
+async def _media_converge_once() -> bool:
+    """Rebuild one running line whose container was made for the other media mode. One per
+    pass, so the lines re-register one after another instead of all at once. True if a line
+    was rebuilt.
+
+    A line that cannot be rebuilt (its exit is down, the uplink network is missing, the line
+    limit refuses it) fails before its old container is touched, so it would be picked again
+    on every pass and hold up every line after it. It backs off on its own instead, and the
+    pass moves on to the next line."""
+    wanted = media.mode()
+    now = time.monotonic()
+    for inst in cfg.list_instances():
+        iid = str(inst.get("id") or "")
+        if not iid:
+            continue
+        current = await asyncio.to_thread(engine.media_mode_of, iid)
+        if current is None or current == wanted:
+            _media_retry.pop(iid, None)
+            continue
+        retry = _media_retry.get(iid) or {}
+        if now < retry.get("at", 0.0):
+            continue
+        log.info("line %s: rebuilding for %s media mode", iid, wanted)
+        _record_lifecycle(iid, "media_mode_rebuild", reason_code=wanted)
+        try:
+            await asyncio.to_thread(_start_engine_checked, cfg.get_instance(iid) or inst,
+                                    cfg.get_settings(),
+                                    os.environ.get("MDD_DEV_MOUNTS", "") == "1", "media_mode")
+        except Exception as exc:  # noqa: BLE001 - this line waits, the others go on
+            _media_back_off(iid, retry, now, exc)
+            continue
+        # The old container is gone only now; its AMI connection goes with it.
+        await hub.drop_ami(iid)
+        hub.reset_health(iid, "configuration_restart")
+        started = await asyncio.to_thread(engine.media_mode_of, iid)
+        if started is not None and started != wanted:
+            # Started, but not in the wanted mode: relay-pending, because the media network
+            # could not be prepared. That start succeeded, so without this the line would be
+            # rebuilt, and made to register again, on every pass for as long as the cause
+            # lasts. It waits like a failure instead.
+            _media_back_off(iid, retry, now, f"started as {started}")
+        else:
+            _media_retry.pop(iid, None)
+        return True
+    return False
+
+
+def _media_back_off(iid: str, retry: dict, now: float, reason) -> None:
+    failures = int(retry.get("failures", 0)) + 1
+    delay = min(MEDIA_RETRY_MAX_SECONDS, MEDIA_RETRY_FIRST_SECONDS * 2 ** (failures - 1))
+    _media_retry[iid] = {"at": now + delay, "failures": failures}
+    log.warning("line %s: not in the recorded media mode, retrying in %ds: %s",
+                iid, delay, reason)
+
+
+async def media_supervisor():
+    """Keep the relay running in relay mode and move running lines to the recorded mode.
+
+    The mode is switched outside this process (python -m app.media), so it is read from its
+    file on every pass rather than cached. A change to that file is acted on at the next pass
+    instead of waiting for the next periodic check, so the relay counts as ready within
+    MEDIA_CONVERGE_SECONDS of a switch."""
+    last_supervise = 0.0
+    last_state_mtime = None
+    while True:
+        try:
+            try:
+                state_mtime = os.stat(media._state_path()).st_mtime
+            except OSError:
+                state_mtime = None
+            if (state_mtime != last_state_mtime
+                    or time.monotonic() - last_supervise >= MEDIA_SUPERVISE_SECONDS):
+                last_supervise = time.monotonic()
+                last_state_mtime = state_mtime
+                await asyncio.to_thread(media.supervise)
+                await asyncio.to_thread(engine.reconcile_rtp_forward)
+            await _media_converge_once()
+        except Exception as exc:  # noqa: BLE001 - supervision must never stop
+            log.warning("media supervision failed: %s", exc)
+        await asyncio.sleep(MEDIA_CONVERGE_SECONDS)
+
+
+def _line_media_report(iid: str) -> dict:
+    """The engine's own report on its media interface (engine/entrypoint.sh), relay mode."""
+    return engine.read_run_json(iid, "media.json") or {}
+
+
+def _line_media_state(iid: str) -> str:
+    return str(_line_media_report(iid).get("state") or "starting")
+
+
 async def status_poller():
     last_prune = 0.0
     while True:
@@ -1512,6 +1746,7 @@ async def status_poller():
             await sync_modem_msisdns()
             await asyncio.gather(*(_poll_instance_status(inst)
                                    for inst in instances))
+            await _check_line_offline(instances)
             if time.monotonic() - last_prune >= LINE_HISTORY_PRUNE_INTERVAL_SECONDS:
                 last_prune = time.monotonic()
                 await asyncio.to_thread(store.prune_line_states,
@@ -1522,6 +1757,117 @@ async def status_poller():
             await asyncio.wait_for(hub.status_wakeup.wait(), timeout=_status_poll_delay(instances))
         except asyncio.TimeoutError:
             pass
+
+
+def _line_offline_observation(inst: dict) -> tuple[str | None, str]:
+    """Classify a line's latest sample for the offline notification.
+
+    Driven by the user's intent rather than by the status label: an enabled line whose
+    container is not running reads STOPPED, which the timeline files as "off", but nobody
+    asked for it to be off and it is exactly the kind of silent outage this exists to report.
+    """
+    iid = str(inst["id"])
+    if not inst.get("enabled", True) or inst.get("provisioning_state") == "draft":
+        return line_offline.IGNORE, ""
+    st = hub.status_cache.get(iid)
+    if not st:
+        return None, ""
+    state = str(st.get("state") or "").upper()
+    if state == "OK":
+        return line_offline.UP, ""
+    if _line_state_kind(st) is None:
+        return None, ""
+    allowed, blocked = _line_auto_start_allowed(inst)
+    if not allowed and blocked != "no_card":
+        return line_offline.IGNORE, ""
+    return line_offline.DOWN, line_offline.reason_text(state, str(st.get("reason_code") or ""))
+
+
+def _line_offline_state_path() -> str:
+    return os.path.join(cfg.DATA_DIR, "line-offline-state.json")
+
+
+def _load_line_offline_state() -> dict[str, dict]:
+    try:
+        with open(_line_offline_state_path(), encoding="utf-8") as handle:
+            return line_offline.restore(json.load(handle))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_line_offline_state(state: dict) -> None:
+    path = _line_offline_state_path()
+    try:
+        temporary = path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+        os.replace(temporary, path)
+    except OSError as exc:
+        log.debug("cannot persist line offline state: %r", exc)
+
+
+def _line_offline_clock(wall: float) -> str:
+    return datetime.fromtimestamp(wall, _local_tz()).strftime("%m-%d %H:%M")
+
+
+async def _check_line_offline(instances: list[dict]) -> None:
+    """Announce lines that stayed offline past the threshold, and their recovery."""
+    try:
+        if hub.line_offline_state is None:
+            hub.line_offline_state = await asyncio.to_thread(_load_line_offline_state)
+        settings = cfg.get_settings()
+        observations = {str(inst["id"]): _line_offline_observation(inst) for inst in instances}
+        went_offline, recovered, changed = line_offline.evaluate(
+            hub.line_offline_state, observations, line_offline.threshold_seconds(settings),
+            time.time(), time.monotonic())
+        if changed:
+            await asyncio.to_thread(_save_line_offline_state,
+                                    line_offline.persistable(hub.line_offline_state))
+        by_id = {str(inst["id"]): inst for inst in instances}
+        for event, entries in ((notify_push.EV_LINE_OFFLINE, went_offline),
+                               (notify_push.EV_LINE_RECOVERED, recovered)):
+            if entries:
+                _announce_line_offline(settings, event, entries, by_id)
+    except Exception as exc:  # noqa - a notification must never stall status sampling
+        log.debug("line offline check failed: %r", exc)
+
+
+def _announce_line_offline(settings: dict, event: str, entries: list[dict],
+                           by_id: dict[str, dict]) -> None:
+    offline = event == notify_push.EV_LINE_OFFLINE
+    for entry in entries:
+        log.warning("line %s %s %.0fs offline", entry["instance"],
+                    "has been" if offline else "recovered after", entry["duration"])
+
+    def describe(entry: dict) -> str:
+        head = (f"已离线 {line_offline.format_duration(entry['duration'])}"
+                f"（自 {_line_offline_clock(entry['since'])} 起）")
+        return f"{head}。\n{entry['reason']}" if offline and entry.get("reason") else f"{head}。"
+
+    if len(entries) == 1:
+        entry = entries[0]
+        inst = by_id.get(entry["instance"]) or {"id": entry["instance"]}
+        tail = ("网关仍在自动重试，恢复后会再通知。" if offline
+                else "线路已重新注册，可以正常收发短信和通话。")
+        text = f"{describe(entry)}\n{tail}"
+        source = inst.get("msisdn") or ""
+        target, match = inst, None
+    else:
+        # Lines that drop together share a cause — the uplink, the exit, the power — and one
+        # message says so better than a burst of identical ones. Feishu bots routed by line
+        # still receive it when any of their lines is among them.
+        names = []
+        for entry in entries:
+            inst = by_id.get(entry["instance"]) or {}
+            name = inst.get("name") or f"线路 {entry['instance']}"
+            names.append(f"• {name}：{describe(entry).replace(chr(10), ' ')}")
+        tail = ("多条线路同时离线，通常是网络、出口或供电问题。网关仍在自动重试。" if offline
+                else "以上线路已重新注册。")
+        text = "\n".join([*names, "", tail])
+        target = {"id": "", "name": f"{len(entries)} 条线路"}
+        source, match = "", [entry["instance"] for entry in entries]
+    asyncio.create_task(asyncio.to_thread(
+        notify_push.dispatch, settings, event, target, source, text, match))
 
 
 HOST_ALERT_POLL_SECONDS = 60.0
@@ -1622,6 +1968,26 @@ def _line_subscriber(iid: str) -> str:
     return f"imsi:{imsi}" if imsi else ""
 
 
+# Opens the push sent when a late part completes a text already pushed incomplete, so the
+# second notification reads as the rest of the first rather than as a new message.
+SMS_COMPLETED_MARK = "（补全）"
+
+
+async def _publish_completed_sms(rec: dict) -> None:
+    """Announce a text that a late part has just made whole (#193).
+
+    Its incomplete form was published when the reaper gave up waiting -- pushed like any text,
+    since that is what stored it -- and many people read only the push, where the missing part
+    may have been the code they were waiting for. So the whole text is pushed once more, once
+    the last part is in rather than for each part on the way. It is not a new arrival for read
+    state: the message stays where the reader saw it, marked completed.
+    """
+    iid = str(rec["instance"])
+    await asyncio.to_thread(_harvest_allowance_reply, iid, rec["peer"])
+    _dispatch_push(notify_push.EV_INCOMING_SMS, iid, rec["peer"],
+                   SMS_COMPLETED_MARK + rec["body"])
+
+
 async def _publish_incoming_sms(rec: dict) -> None:
     """Announce one newly stored inbound text, whichever transport delivered it."""
     iid = str(rec["instance"])
@@ -1651,8 +2017,9 @@ def _mms_push_text(rec: dict) -> str:
     return summary
 
 
-# How often the MMS worker looks for attachment files an interrupted save or deletion left.
-MMS_SWEEP_SECONDS = 6 * 3600
+# How often the MMS worker looks for attachment files an interrupted save or deletion left,
+# and for uploads of a message that was never sent.
+MMS_SWEEP_SECONDS = 3600
 
 
 async def mms_worker():
@@ -1674,8 +2041,11 @@ async def mms_worker():
                 removed = await asyncio.to_thread(store.sweep_mms_orphans)
                 if removed:
                     log.info("removed %d unreferenced MMS file(s)", removed)
+                removed = await asyncio.to_thread(mms_staging.sweep)
+                if removed:
+                    log.info("removed %d abandoned MMS attachment upload(s)", removed)
             except Exception as exc:  # noqa
-                log.debug("MMS orphan sweep failed: %r", exc)
+                log.debug("MMS sweep failed: %r", exc)
         try:
             due = await asyncio.to_thread(store.due_mms_downloads)
         except Exception as exc:  # noqa
@@ -1842,7 +2212,11 @@ async def host_health_poller():
     previous_alerts = None
     while True:
         try:
-            snapshot = await asyncio.to_thread(sysinfo.collect, cfg.DATA_DIR)
+            # Docker df walks every image-layer xattr on DSM and can occupy dockerd for minutes.
+            # The minute health sampler needs host health, not an inventory of reclaimable
+            # layers; explicit cleanup actions refresh that inventory after the operator asks.
+            snapshot = await asyncio.to_thread(
+                sysinfo.collect, cfg.DATA_DIR, include_docker_storage=False)
             # Rate-based conditions need the previous sample; the first pass reports none.
             alerts = sysinfo.alerts(snapshot, hub.host_snapshot or None)
             alerts = _sustained_alerts(alerts, streaks)
@@ -2475,6 +2849,22 @@ def apply_health(iid, inst, st, container_id: str | None = None):
         h["retry_count"] = 0
         st["retry"] = {"count": 0, "max": rmax}
         return st
+    if state == "EPDG_UNRESOLVED":
+        support = vowifi_support.for_instance(inst)
+        if support["source"] == "carrier_table":
+            # The user chose to try a carrier that does not offer Wi-Fi Calling. Retrying on
+            # a timer only repeats the same DNS answer; stop and say why. Only the carrier
+            # table is trusted this far: a missing DNS answer can also be an outage.
+            h["frozen_code"] = st["reason_code"]
+            h["frozen_reason"] = support["reason"]
+            h["next_retry_at"] = None
+            _record_lifecycle(iid, "recovery_cancelled", "carrier_unsupported",
+                              retry_count=h.get("retry_count"), card_present=True)
+            asyncio.create_task(asyncio.to_thread(
+                engine.capture_and_stop, iid, inst, "health-freeze:carrier_unsupported",
+                container_id))
+            asyncio.create_task(hub.drop_ami(str(iid)))
+            return _frozen(h, st, rmax)
     if state == "PIN_PROBLEM":
         # wrong/blocked PIN won't recover by retrying — surface immediately.
         h["frozen_code"] = st["reason_code"]
@@ -2587,7 +2977,10 @@ async def update_automation_poller():
     await asyncio.sleep(30)
     while True:
         try:
-            await asyncio.to_thread(update_check.automation_cycle)
+            result = await asyncio.to_thread(update_check.automation_cycle)
+            if (operations.container_stack_enabled() and isinstance(result, dict)
+                    and result.get("auto_update_requested")):
+                await asyncio.to_thread(operations.launch_container_update)
         except Exception as exc:  # noqa: a failed poll must never take the control plane down
             log.warning("background update check failed: %s", type(exc).__name__)
         await asyncio.sleep(max(300, UPDATE_CHECK_INTERVAL_SECONDS))
@@ -2595,6 +2988,8 @@ async def update_automation_poller():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if operations.container_stack_enabled():
+        await asyncio.to_thread(operations.settle_container_service_restart)
     _keep_modem_storage_on_upgrade(store.schema_version())
     store.set_subscriber_resolver(_line_subscriber)
     try:
@@ -2641,6 +3036,7 @@ async def lifespan(app: FastAPI):
     segment_reaper = asyncio.create_task(sms_segment_reaper())
     mms_runner = asyncio.create_task(mms_worker())
     update_poller = asyncio.create_task(update_automation_poller())
+    media_task = asyncio.create_task(media_supervisor())
     for iid in recovered_modem_lines:
         asyncio.create_task(_auto_start_hotplugged_line(iid))
     yield
@@ -2651,10 +3047,12 @@ async def lifespan(app: FastAPI):
     segment_reaper.cancel()
     mms_runner.cancel()
     update_poller.cancel()
+    media_task.cancel()
     # Reap the cancelled tasks (the monitor may be parked in a to_thread wait for up to
     # its timeout; awaiting keeps shutdown deterministic instead of leaking the error).
     await asyncio.gather(poller, monitor, sms_poller, host_poller,
-                         segment_reaper, mms_runner, update_poller, return_exceptions=True)
+                         segment_reaper, mms_runner, update_poller, media_task,
+                         return_exceptions=True)
     await hub.runtime.close()
     for c in hub.ami.values():
         await c.close()
@@ -2663,42 +3061,21 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="MDD Sim Gateway", lifespan=lifespan)
 
-_AUTH_PUBLIC = {"/api/auth/status", "/api/auth/setup", "/api/auth/login"}
-
-
-@app.middleware("http")
-async def require_admin_session(request: Request, call_next):
-    """Protect every management API and require CSRF on state changes.
-
-    The engine callback is authenticated separately with the per-install internal token.
-    Static assets remain public so the browser can render the login screen.
-    """
-    path = request.url.path
-    if not path.startswith("/api/") or path in _AUTH_PUBLIC:
-        return await call_next(request)
-    if path == "/api/engine/event":
-        expected = cfg.internal_event_token()
-        supplied = request.headers.get("x-mdd-engine-token", "")
-        if not expected or not hmac.compare_digest(supplied, expected):
-            return JSONResponse({"detail": "invalid engine token"}, status_code=401)
-        return await call_next(request)
-    current = auth.session(request.cookies.get(auth.SESSION_COOKIE))
-    if not current:
-        return JSONResponse({"detail": "authentication required"}, status_code=401)
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-        supplied = request.headers.get("x-mdd-csrf-token", "")
-        if not hmac.compare_digest(supplied, current["csrf"]):
-            return JSONResponse({"detail": "invalid CSRF token"}, status_code=403)
-    request.state.admin_session = current
-    return await call_next(request)
+# Authentication for every API request and WebSocket handshake; see gate.py.
+app.add_middleware(gate.Gate)
 
 
 @app.get("/api/auth/status")
 def api_auth_status(request: Request):
-    current = auth.session(request.cookies.get(auth.SESSION_COOKIE))
-    return {"configured": auth.configured(), "authenticated": bool(current),
-            "username": auth.username(),
-            "csrf": current.get("csrf") if current else ""}
+    who = gate.current(request)
+    body = {"configured": auth.configured(), "authenticated": who.kind == "admin",
+            "username": auth.username(), "csrf": who.csrf,
+            # What this gateway offers a client app, which may be newer or older than it.
+            "api": 1, "features": ["client_tokens"]}
+    if who.kind == "client":
+        # A client that reaches this is signed in: its token was checked on the way.
+        body.update({"authenticated": True, "kind": "client", "client_id": who.client_id})
+    return body
 
 
 @app.post("/api/auth/setup")
@@ -2709,6 +3086,11 @@ def api_auth_setup(body: dict, request: Request):
         auth.setup(str(body.get("password") or ""), str(body.get("username") or "admin"))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    # Setting up again follows `install.sh reset-admin` -- typically because a phone or a
+    # password was lost -- so nothing signed in with the old account survives it.
+    clients.revoke_all()
+    gate.revoke_kind("session")
+    gate.revoke_kind("client")
     remember = bool(body.get("remember"))
     result = auth.login(str(body.get("username") or "admin"), str(body.get("password") or ""),
                         request.client.host if request.client else "", remember=remember)
@@ -2747,6 +3129,7 @@ def api_auth_login(body: dict, request: Request):
 @app.post("/api/auth/logout")
 def api_auth_logout(request: Request):
     auth.logout(request.cookies.get(auth.SESSION_COOKIE))
+    gate.revoke(gate.current(request).credential)
     response = JSONResponse({"ok": True})
     response.delete_cookie(auth.SESSION_COOKIE, path="/")
     return response
@@ -2759,20 +3142,67 @@ def api_auth_password(body: dict, request: Request):
                              str(body.get("new_password") or ""))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    # A new password ends every sign-in made with the old one: browsers and client apps alike.
+    clients.revoke_all()
+    gate.revoke_kind("session")
+    gate.revoke_kind("client")
     response = JSONResponse({"ok": True, "reauthenticate": True})
     response.delete_cookie(auth.SESSION_COOKIE, path="/")
     return response
 
 
+@app.post("/api/auth/client/login")
+def api_auth_client_login(body: dict, request: Request):
+    """Sign a client app in with the administrator's credentials; it gets a bearer token.
+
+    The token is returned this once. Only its digest is stored, so it cannot be shown again."""
+    if not auth.configured():
+        raise HTTPException(409, "administrator setup is required")
+    peer = request.client.host if request.client else ""
+    retry = auth.throttled(peer)
+    if retry:
+        return JSONResponse({"detail": "too many attempts", "retry_after": retry},
+                            status_code=429, headers={"Retry-After": str(retry)})
+    if not auth.verify(str(body.get("username") or "admin"), str(body.get("password") or ""),
+                       peer):
+        raise HTTPException(401, "invalid username or password")
+    for evicted in clients.make_room():
+        gate.revoke(f"client:{evicted}")
+    try:
+        client, token = clients.register(str(body.get("name") or ""),
+                                         str(body.get("platform") or "other"),
+                                         str(body.get("app_version") or ""))
+    except clients.ClientError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"token": token, "client": client}
+
+
+@app.post("/api/auth/client/logout")
+def api_auth_client_logout(request: Request):
+    who = gate.current(request)
+    if who.kind != "client":
+        raise HTTPException(400, "only a client app signs itself out here")
+    clients.revoke(who.client_id)
+    gate.revoke(who.credential)
+    return {"ok": True}
+
+
+@app.get("/api/auth/clients")
+def api_auth_clients():
+    return {"clients": clients.list_clients()}
+
+
+@app.delete("/api/auth/clients/{client_id}")
+def api_auth_client_revoke(client_id: int):
+    if not clients.revoke(client_id):
+        raise HTTPException(404, "no such client")
+    gate.revoke(f"client:{client_id}")
+    return {"ok": True}
+
+
 def _audit_client(request: Request, settings: dict) -> str:
     peer = request.client.host if request.client else ""
-    trusted = (settings.get("security") or {}).get("trusted_proxies") or []
-    try:
-        address = ipaddress.ip_address(peer)
-        allowed = any(address in ipaddress.ip_network(str(item), strict=False) for item in trusted)
-    except ValueError:
-        allowed = False
-    if allowed:
+    if gate.trusted_proxy(peer, settings):
         forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
         try:
             return str(ipaddress.ip_address(forwarded))
@@ -2788,7 +3218,8 @@ async def audit_mutations(request: Request, call_next):
         settings = cfg.get_settings()
         _write_audit_record({"at": int(time.time()), "method": request.method,
                              "path": request.url.path, "status": response.status_code,
-                             "client": _audit_client(request, settings)}, settings)
+                             "client": _audit_client(request, settings),
+                             "actor": gate.current(request).label}, settings)
     return response
 
 
@@ -2832,8 +3263,15 @@ async def api_sim_detect(reader_index: int = 0):
         raise HTTPException(400, "reader index out of range")
     name = rlist[reader_index]
     async with hub.reader_lock(name):
-        return await asyncio.to_thread(
-            lambda: _client_card_info(sim.read_card(reader_index).dict()))
+        card = await asyncio.to_thread(sim.read_card, reader_index)
+    # This read used to reach only the form. A draft waiting on a field the insertion read
+    # missed then stayed a draft until the operator also pressed Save.
+    entry = hub.cards.get(name)
+    if entry is not None and _merge_card_read(entry, card):
+        iid = str(entry.get("matched") or "")
+        if iid and not _draft_needs_card_read(name):
+            asyncio.create_task(_auto_start_hotplugged_line(iid))
+    return _client_card_info(card.dict())
 
 
 def _resolve_reader_index(body: dict) -> int:
@@ -3244,7 +3682,9 @@ def _modem_active_slot_capacity(hardware_id: str, sibling_count: int) -> int:
     identity = (_device_identities().get(hardware_id)
                 or _modem_identity_for_reader(f"VoWiFi Modem {hardware_id} 00 00")
                 or {})
-    raw = (identity.get("channel_allocated")
+    # A card with too few channels still serves every slot on a shared one.
+    raw = (identity.get("slots_served")
+           or identity.get("channel_allocated")
            or identity.get("channel_capacity")
            or identity.get("slots")
            or sibling_count)
@@ -3429,6 +3869,29 @@ def _reader_port_for_instance(inst: dict) -> str | None:
             if c.get("present") and c.get("iccid") == iccid and c.get("reader_port"):
                 return c.get("reader_port")
     return None
+
+
+def _live_reader_binding_for_instance(inst: dict) -> dict:
+    """The reader_port/reader_index where the card monitor sees this line's SIM right now.
+
+    Only for a line on an ordinary PC/SC reader: a modem's virtual readers carry one SIM on
+    several logical slots and are rebound from the bridge metadata instead. Uses what the
+    monitor has already read -- no APDU is sent, so a running engine is never raced. Empty
+    when the SIM is not seen, or when more than one present reader claims it.
+    """
+    wanted = str(inst.get("iccid") or "").strip()
+    if not wanted or inst.get("swu_reader"):
+        return {}
+    holders = [c for c in hub.cards.values()
+               if c.get("present") and c.get("iccid") == wanted and c.get("reader_port")
+               and not str(c.get("name") or "").startswith("VoWiFi Modem ")]
+    if len(holders) != 1:
+        return {}
+    found = holders[0]
+    binding = {"reader_port": str(found["reader_port"])}
+    if found.get("index") is not None:
+        binding["reader_index"] = int(found["index"])
+    return binding
 
 
 def _card_identity_mismatch(inst: dict) -> dict | None:
@@ -3981,6 +4444,13 @@ async def _unified_devices() -> list[dict]:
     configured_exits = settings.get("proxy", {}).get("exits", {}) or {}
     available_countries = sorted(country for country, value in configured_exits.items()
                                  if isinstance(value, dict) and value.get("enabled", False))
+    # Host routing publishes per-line state, while the container SOCKS transport publishes
+    # one shared listener/state per country.  Device presentation must understand both
+    # contracts: a working container exit otherwise appears as "Not connected" even while
+    # the Engine is actively sending IKE through it.
+    egress_state = egress.status()
+    egress_lines = egress_state.get("lines") or {}
+    egress_exits = egress_state.get("exits") or {}
     result = []
     for device_id in device_ids:
         native_card = native_readers.get(device_id)
@@ -4005,6 +4475,11 @@ async def _unified_devices() -> list[dict]:
                       "flight_mode": False})
         cell_desired = bool(wanted.get("cellular_enabled"))
         vowifi_desired = bool(wanted.get("vowifi_enabled"))
+        if inst and not is_native_reader:
+            # A modem's switch is device-wide, but the line it would start can be disabled on
+            # its own (a carrier without VoWiFi is provisioned that way). Showing the switch on
+            # over a disabled line read as "enabled but no line is running" forever.
+            vowifi_desired = vowifi_desired and bool(inst.get("enabled", True))
         flight_desired = bool(wanted.get("flight_mode"))
         line_status = _cached_line_status(inst) if inst else None
         running = bool(inst) and (line_status or {}).get("state") != "STOPPED"
@@ -4019,6 +4494,12 @@ async def _unified_devices() -> list[dict]:
         elif is_draft:
             vowifi.update(available=False,
                           reason="Automatic setup is waiting for SIM or hardware information")
+        support_source = inst or native_card or {}
+        vowifi["support"] = vowifi_support.for_instance(
+            support_source if support_source.get("mcc") else {})
+        if (vowifi["support"]["status"] == vowifi_support.UNSUPPORTED
+                and vowifi.get("actual") == "off" and not vowifi.get("reason")):
+            vowifi["reason"] = vowifi["support"]["reason"]
 
         actual_state = observed.get("actual") or {}
         # Published by the orchestrator when this gateway is configured VoWiFi-only
@@ -4048,6 +4529,21 @@ async def _unified_devices() -> list[dict]:
                     cell_actual = "off"
                 elif flight_desired:
                     cell_actual, cell_reason = "off", "Flight mode is enabled"
+                elif host_cell.get("state") == "failed":
+                    # ModemManager gave up on the modem; the orchestrator reboots it when
+                    # that can help. VoWiFi runs through the bridge regardless.
+                    failure = host_cell.get("failure") or {}
+                    cell_actual = "error"
+                    cell_reason = (
+                        "ModemManager could not start this modem. Check the SIM."
+                        if not failure.get("resettable", True) else
+                        "ModemManager could not start this modem, and it could not be "
+                        "rebooted. Reconnect the modem or restart the host."
+                        if failure.get("exhausted") and not failure.get("rebooted", 1) else
+                        "ModemManager could not start this modem, and rebooting it did not "
+                        "help. Reconnect the modem or restart the host."
+                        if failure.get("exhausted") else
+                        "ModemManager could not start this modem. It is being rebooted.")
                 elif radio_on and registered and host_cell.get("data_active"):
                     cell_actual = "on"
                 elif radio_on:
@@ -4091,12 +4587,30 @@ async def _unified_devices() -> list[dict]:
                 "carrier_identity": (inst or {}).get("carrier_identity") or {},
             }
         carrier = _carrier_description(inst, card_info, cellular_view)
+        exit_country = egress.line_country(inst or card_info)
+        line_exit = egress_lines.get(str(inst["id"]) if inst else "", {}) or {}
+        country_exit = egress_exits.get(exit_country, {}) or {}
+        active_exit = line_exit if line_exit.get("node") else country_exit
         if native_card:
             hardware_imei, _hardware_id, _hardware_type = _hardware_imei_for_card(
                 native_card, cards)
             hardware_record = device_state.hardware().get(device_id) or hardware_record
         else:
             hardware_imei = cfg.normalize_imei(identity.get("imei", ""))
+        draft_missing = None
+        if is_draft and card_info.get("present"):
+            # Exactly the rule that decides promotion, so the page cannot name one field
+            # while the line is really waiting for another.
+            missing = draft_missing = _draft_missing(inst, card_info, cards)
+            if missing == ["IMEI"]:
+                vowifi.update(available=False, reason=(
+                    "Set a 15-digit IMEI in Hardware; the line will then start automatically"))
+            elif "IMEI" in missing:
+                vowifi.update(available=False, reason=(
+                    "Set the IMEI in Hardware and complete the SIM details; the line will then start automatically"))  # noqa: E501 - one literal: the i18n coverage test reads it
+            elif missing:
+                vowifi.update(available=False, reason=(
+                    "Complete the SIM details; the line will then start automatically"))
         masked_imei = _masked_identifier(hardware_imei)
         bridge_active = bool(actual_state.get("vowifi_bridge_active"))
         logical_channels = (None if is_native_reader else
@@ -4129,6 +4643,8 @@ async def _unified_devices() -> list[dict]:
             "reader": card_info.get("name") or "", "instance_id": str(inst["id"]) if inst else None,
             "status": line_status,
             "logical_channels": logical_channels,
+            "custom_model": (None if is_native_reader
+                             else _custom_model_view(assignment, identity)),
             "sim": {"name": (((inst or {}).get("name")
                              or (cellular_view or {}).get("operator") or "SIM") if inst else ""),
                     "number": (inst or {}).get("msisdn") or "",
@@ -4147,25 +4663,26 @@ async def _unified_devices() -> list[dict]:
                        # engine config (config.py).
                        "accept_epdg_rekey": bool((inst or {}).get("accept_epdg_esp_rekey",
                            (cfg.get_settings().get("rekey") or {}).get("accept_epdg", False)))},
-            "egress": {"node": (egress.status().get("lines") or {}).get(
-                str(inst["id"]) if inst else "", {}).get("node") or "",
+            "egress": {"node": active_exit.get("node") or "",
                 # The picker lives on the settings page, so without these the device page shows
                 # a node that silently disagrees with what the operator chose.
-                **{key: ((egress.status().get("exits") or {}).get(
-                    egress.line_country(inst or card_info), {}).get(key) or "")
+                **{key: (country_exit.get(key) or "")
                    for key in ("pinned_node", "pin_mode", "selection",
                                # Why the exit moved, and whether the pinned node is still
                                # serving a cooldown — otherwise a mismatch looks arbitrary.
                                "last_change", "pinned_cooldown_seconds")},
-                "country": egress.line_country(inst or card_info),
+                "country": exit_country,
                 "detected_country": egress.country_for_mcc((inst or card_info).get("mcc")),
                 "override": egress.normalize_country((inst or {}).get("proxy_country")),
                 "available_countries": available_countries},
             "provisioning": {"state": "draft" if is_draft else "ready" if inst else "detecting",
-                "missing": ([key for key, value in (
-                    ("imsi", (inst or card_info).get("imsi")),
-                    ("imei", hardware_imei),
-                    ("smsc", (inst or card_info).get("smsc"))) if not value])},
+                # IMEI is set on the Hardware tab; everything else on the SIM tab.
+                "missing": ([_DRAFT_FIELD_KEYS[name] for name in draft_missing]
+                            if draft_missing is not None else
+                            [key for key, value in (
+                                ("imsi", (inst or card_info).get("imsi")),
+                                ("imei", hardware_imei),
+                                ("smsc", (inst or card_info).get("smsc"))) if not value])},
             "capabilities": {"cellular": {"desired": cell_desired, "actual": cell_actual,
                                              "reason": cell_reason},
                              "flight": {"desired": flight_desired,
@@ -4190,6 +4707,147 @@ async def api_devices():
             "shared": device_state.status().get("shared") or {}}
 
 
+# ------------------------------------------------------------ unrecognised USB modems
+# The host side (orchestrator or Hardware container) lists modem-like USB devices that match
+# no model and tests one on request; Control cannot see /sys and only relays.
+MODEM_PROBE_TIMEOUT = 60.0
+USB_CANDIDATES_MAX_AGE = 120.0
+
+
+def _orchestrator_path(*parts: str) -> str:
+    return os.path.join(cfg.DATA_DIR, "orchestrator", *parts)
+
+
+def _usb_candidates() -> list[dict]:
+    document = _read_json_file(_orchestrator_path("usb-candidates.json"))
+    try:
+        fresh = time.time() - float(document.get("updated_at") or 0) < USB_CANDIDATES_MAX_AGE
+    except (TypeError, ValueError):
+        fresh = False
+    candidates = document.get("candidates") if fresh else []
+    return [item for item in candidates or [] if isinstance(item, dict)]
+
+
+def _modem_profile_key(profile: dict) -> tuple[str, str]:
+    return (str(profile.get("vid") or "").lower(), str(profile.get("pid") or "").lower())
+
+
+def _custom_model_view(assignment: dict, identity: dict) -> dict | None:
+    """How the device page describes a model added through a probe, or None."""
+    key = _modem_profile_key(assignment)
+    profile = next((item for item in (cfg.get_settings().get("hardware") or {})
+                    .get("modem_profiles") or []
+                    if isinstance(item, dict) and item.get("source") == "probe"
+                    and _modem_profile_key(item) == key), None)
+    if not profile:
+        return None
+    # Saved without a SIM to test on: proven by the bridge opening its channels since.
+    verified = bool(profile.get("verified")) or identity.get("channel_status") == "ready"
+    return {"vid": key[0], "pid": key[1], "name": str(profile.get("name") or ""),
+            "verified": verified}
+
+
+def _write_modem_probe_request(candidate: dict) -> tuple[str, str]:
+    request_id = f"probe-{int(time.time() * 1000)}-{random.randrange(1_000_000):06d}"
+    request_dir = _orchestrator_path("modem-probe-requests")
+    os.makedirs(request_dir, mode=0o700, exist_ok=True)
+    path = os.path.join(request_dir, f"{request_id}.json")
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump({"request_id": request_id, "usb_path": candidate["usb_path"],
+                   "vid": candidate["vid"], "pid": candidate["pid"],
+                   "requested_at": time.time()}, handle)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+    return request_id, _orchestrator_path("modem-probe-status", f"{request_id}.json")
+
+
+def _save_probed_modem_profile(status: dict) -> dict:
+    hardware = dict(cfg.get_settings().get("hardware") or {})
+    key = (str(status["vid"]).lower(), str(status["pid"]).lower())
+    profiles = [item for item in hardware.get("modem_profiles") or []
+                if isinstance(item, dict) and _modem_profile_key(item) != key]
+    profile = {"name": str(status.get("name") or f"USB modem {key[0]}:{key[1]}")[:80],
+               "vid": key[0], "pid": key[1], "at_interface": int(status["at_interface"]),
+               "source": "probe", "verified": status.get("result") == "usable"}
+    hardware["modem_profiles"] = profiles + [profile]
+    cfg.update_settings({"hardware": hardware})
+    return profile
+
+
+@app.get("/api/hardware/usb-candidates")
+async def api_usb_candidates():
+    return {"candidates": [
+        {key: item.get(key) for key in ("usb_path", "vid", "pid", "manufacturer", "product")}
+        | {"serial_ports": len(item.get("interfaces") or {}),
+           "claimed_by_modemmanager": bool(item.get("mm_object"))}
+        for item in _usb_candidates()]}
+
+
+@app.post("/api/hardware/usb-candidates/{usb_path}/probe")
+async def api_probe_usb_candidate(usb_path: str):
+    """Test one unrecognised device and, if it can reach a SIM, add it as a model."""
+    candidate = next((item for item in _usb_candidates() if item.get("usb_path") == usb_path),
+                     None)
+    if candidate is None:
+        raise HTTPException(404, "this USB device is no longer listed")
+    request_id, status_path = await asyncio.to_thread(_write_modem_probe_request, candidate)
+    deadline = time.monotonic() + MODEM_PROBE_TIMEOUT
+    status: dict = {}
+    while time.monotonic() < deadline:
+        status = _read_json_file(status_path)
+        if status.get("request_id") == request_id and status.get("state") == "done":
+            break
+        await asyncio.sleep(.5)
+    else:
+        raise HTTPException(504, "the hardware service did not finish the test in time")
+    result = str(status.get("result") or "")
+    saved = None
+    if result in {"usable", "unverified"} and status.get("at_interface") is not None:
+        saved = await asyncio.to_thread(_save_probed_modem_profile, status)
+        egress.publish(settings=cfg.get_settings())
+    return {"result": result, "detail": status.get("detail") or "",
+            "steps": status.get("steps") or [], "saved": saved}
+
+
+@app.delete("/api/hardware/modem-profiles/{vid}/{pid}")
+async def api_delete_modem_profile(vid: str, pid: str):
+    """Remove a model added through a probe. Built-in models cannot be removed."""
+    key = (vid.lower(), pid.lower())
+    hardware = dict(cfg.get_settings().get("hardware") or {})
+    profiles = [item for item in hardware.get("modem_profiles") or [] if isinstance(item, dict)]
+    target = next((item for item in profiles if _modem_profile_key(item) == key), None)
+    if target is None:
+        raise HTTPException(404, "no such modem model")
+    if target.get("source") != "probe":
+        raise HTTPException(400, "built-in modem models cannot be removed")
+    hardware["modem_profiles"] = [item for item in profiles if item is not target]
+    cfg.update_settings({"hardware": hardware})
+    egress.publish(settings=cfg.get_settings())
+    return {"removed": {"vid": key[0], "pid": key[1]}}
+
+
+@app.post("/api/devices/{device_id}/sim/reread")
+async def api_device_sim_reread(device_id: str):
+    """Read this device's SIM again; a draft completed by it is promoted and started."""
+    cards = hub.cards_list()
+    name = next((str(card.get("name") or "") for card in cards
+                 if card.get("present") and _device_for_card(card, cards)[0] == device_id), "")
+    if not name:
+        raise HTTPException(404, "no SIM is present in this device")
+    filled = await _reread_card(name)
+    iid = str((hub.cards.get(name) or {}).get("matched") or "")
+    inst = cfg.get_instance(iid) if iid else None
+    is_draft = bool(inst and inst.get("provisioning_state") == "draft")
+    missing = _draft_missing(inst, hub.cards.get(name) or {}, hub.cards_list()) if is_draft else []
+    # Only a complete draft is handed on; one still waiting for the IMEI or a PIN reports that.
+    completing = is_draft and not missing
+    if completing:
+        asyncio.create_task(_auto_start_hotplugged_line(iid))
+    await hub.broadcast({"type": "cards", "cards": _client_cards()})
+    return {"ok": True, "updated": filled, "completing": completing, "missing": missing}
+
+
 @app.put("/api/devices/{device_id}/hardware")
 async def api_device_hardware(device_id: str, body: dict):
     """Save user-managed physical hardware identity (currently native-reader IMEI)."""
@@ -4209,26 +4867,48 @@ async def api_device_hardware(device_id: str, body: dict):
         "stable_path": device.get("stable_path") or "", "imei": imei})
 
     # A running line renders the device identity inside its container. Apply a hardware
-    # change immediately to the SIM currently inserted in this reader.
+    # change immediately to the SIM currently inserted in this reader. A new reader line is
+    # deliberately a stopped draft until its hardware IMEI exists; saving that last missing
+    # fact must also promote and start it, without requiring a second Save on the SIM tab.
     iid = str(device.get("instance_id") or "")
     applied = False
+    started = False
     if iid and imei:
         inst = cfg.get_instance(iid) or {}
-        previous_imeisv = str(inst.get("imeisv") or "")
-        svn = (previous_imeisv[-2:] if len(previous_imeisv) == 16
-               and previous_imeisv[-2:].isdigit() else _random_svn())
-        inst = cfg.upsert_instance({"id": iid, "imei": imei,
-                                    "imei_source_device_id": device_id,
-                                    "imeisv": cfg.imeisv_from_imei(imei, svn=svn)})
-        if await asyncio.to_thread(engine.is_running, iid):
+        cards = hub.cards_list()
+        card_info = next((item for item in cards if item.get("present") and (
+            str(item.get("hardware_id") or "") == device_id
+            or (inst.get("iccid") and str(item.get("iccid") or "")
+                == str(inst.get("iccid") or "")))), None)
+        if inst.get("provisioning_state") == "draft" and card_info:
+            inst = await asyncio.to_thread(_auto_promote_card_draft, inst, card_info, cards)
+        else:
+            previous_imeisv = str(inst.get("imeisv") or "")
+            svn = (previous_imeisv[-2:] if len(previous_imeisv) == 16
+                   and previous_imeisv[-2:].isdigit() else _random_svn())
+            inst = cfg.upsert_instance({"id": iid, "imei": imei,
+                                        "imei_source_device_id": device_id,
+                                        "imeisv": cfg.imeisv_from_imei(imei, svn=svn)})
+        running = await asyncio.to_thread(engine.is_running, iid)
+        if running:
             await hub.drop_ami(iid)
             await asyncio.to_thread(_start_engine_checked, inst, cfg.get_settings(),
                                     dev_mounts=os.environ.get("MDD_DEV_MOUNTS", "") == "1")
             hub.reset_health(iid, "configuration_restart")
             applied = True
+        elif inst.get("provisioning_state") != "draft":
+            allowed, _reason = _line_auto_start_allowed(inst)
+            if allowed:
+                await asyncio.to_thread(_start_engine_checked, inst, cfg.get_settings(),
+                                        dev_mounts=os.environ.get("MDD_DEV_MOUNTS", "") == "1")
+                hub.reset_health(iid, "hardware_identity_completed")
+                applied = True
+                started = True
     await hub.broadcast({"type": "hardware", "device": device_id})
+    still_missing = (list(inst.get("auto_provision_missing") or [])
+                     if iid and imei and inst.get("provisioning_state") == "draft" else [])
     return {"ok": True, "imei_masked": _masked_identifier(record.get("imei")),
-            "applied": applied}
+            "applied": applied, "started": started, "missing": still_missing}
 
 
 def _remove_device_from_document(path: str, device_id: str, mapping_key: str) -> None:
@@ -4279,6 +4959,53 @@ async def api_device_cellular(device_id: str):
         raise HTTPException(404, "no such physical device")
     return {"device_id": device_id, "capability": device["capabilities"]["cellular"],
             "cellular": device.get("cellular")}
+
+
+def _device_modem_path(device_id: str) -> str:
+    """The live ModemManager object of a present modem, or ""."""
+    _desired, observed, _assignments = _device_sources()
+    item = (observed.get("devices") or {}).get(device_id) or {}
+    if not item.get("present"):
+        return ""
+    return str((item.get("cellular") or {}).get("mm_object") or item.get("mm_object") or "")
+
+
+@app.get("/api/devices/{device_id}/ims")
+async def api_device_ims(device_id: str):
+    path = _device_modem_path(device_id)
+    if not path:
+        return {"supported": False, "reason": "The modem is not available."}
+    return await asyncio.to_thread(modem_ims.status, path)
+
+
+@app.get("/api/devices/{device_id}/voice-audio")
+async def api_device_voice_audio(device_id: str):
+    """Read-only: can this modem hand cellular call audio to the gateway?"""
+    path = _device_modem_path(device_id)
+    if not path:
+        return {"status": modem_voice.UNKNOWN, "reason": "The modem is not available."}
+    return await asyncio.to_thread(modem_voice.status, path)
+
+
+@app.put("/api/devices/{device_id}/ims")
+async def api_device_ims_set(device_id: str, body: dict):
+    enabled = (body or {}).get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(400, "enabled must be boolean")
+    async with capability_lock:
+        path = _device_modem_path(device_id)
+        if not path:
+            raise HTTPException(409, "The modem is not available.")
+        current = await asyncio.to_thread(modem_ims.status, path)
+        if not current.get("supported"):
+            raise HTTPException(409, current.get("reason") or "IMS is not supported")
+        result = await asyncio.to_thread(modem_ims.set_enabled, path, enabled)
+    if not result.get("ok"):
+        raise HTTPException(502, result.get("error") or "the modem rejected the change")
+    log.info("modem %s: VoLTE/IMS %s; modem restarting", device_id,
+             "enabled" if enabled else "disabled")
+    await hub.broadcast({"type": "capability", "device": device_id, "ims": enabled})
+    return result
 
 
 @app.post("/api/devices/{device_id}/diagnostics")
@@ -4504,6 +5231,12 @@ def api_put_settings(body: dict):
             raise HTTPException(400, "invalid new-device defaults")
         if any(not isinstance(value, bool) for value in defaults.values()):
             raise HTTPException(400, "new-device defaults must be boolean")
+    if "line_offline_notify_minutes" in body:
+        minutes = body.get("line_offline_notify_minutes")
+        if isinstance(minutes, bool) or not isinstance(minutes, int) \
+                or not line_offline.MIN_MINUTES <= minutes <= line_offline.MAX_MINUTES:
+            raise HTTPException(400, f"offline notification delay must be "
+                                     f"{line_offline.MIN_MINUTES}-{line_offline.MAX_MINUTES} minutes")
     for channel in ("webhook", "telegram", "pushplus"):
         try:
             notify_push.validate_message_templates(body.get(channel) or {})
@@ -4772,7 +5505,8 @@ def api_system_status():
     settings = cfg.get_settings()
     # Served from the poller's sample: collecting here would shell out to vcgencmd/dmesg on
     # every page load of an already power-constrained box.
-    host = hub.host_snapshot or sysinfo.collect(cfg.DATA_DIR)
+    host = hub.host_snapshot or sysinfo.collect(
+        cfg.DATA_DIR, include_docker_storage=False)
     return {
         "system_name": "MDD Sim Gateway",
         "host": host,
@@ -4782,6 +5516,10 @@ def api_system_status():
         "unheard_voicemails": sum(store.unheard_voicemail_counts().values()),
         "timezone": settings.get("timezone") or "UTC",
         "version": VERSION,
+        "deployment": {
+            "container_stack": operations.container_stack_enabled(),
+            "host_restart_available": not operations.container_stack_enabled(),
+        },
         "repository_url": f"https://github.com/{update_check.repository()}",
         "backups": operations.list_local_backups(),
         "security": {
@@ -4815,7 +5553,7 @@ def api_host_alerts_clear():
 
 @app.get("/api/system/update/check")
 async def api_system_update_check(force: bool = False):
-    """Read-only release lookup. Requires an admin session (see _AUTH_PUBLIC).
+    """Read-only release lookup. Requires an admin session (see gate.PUBLIC_PATHS).
 
     The periodic UI poll uses the short in-process cache; only an explicit "Check for updates"
     click passes force=true, so repeated logins/reloads cannot burn GitHub's unauthenticated
@@ -4838,10 +5576,17 @@ async def api_system_repository_stars(force: bool = False):
 
 @app.post("/api/system/update/apply")
 async def api_system_update_apply(body: dict):
-    """One-click update: publish a request for the host orchestrator, which runs the detached
-    updater (host/mdd_update.py). Responds immediately; progress is polled separately."""
+    """Start a detached update through the host orchestrator or container-stack helper.
+
+    The response remains immediate in both deployment modes; progress is polled separately.
+    """
     version = body.get("version")
-    return await asyncio.to_thread(update_check.request_apply, version=version)
+    result = await asyncio.to_thread(update_check.request_apply, version=version)
+    if result.get("ok") and operations.container_stack_enabled():
+        launched = await asyncio.to_thread(operations.launch_container_update)
+        if not launched.get("ok"):
+            return launched
+    return result
 
 
 @app.get("/api/system/update/progress")
@@ -4918,12 +5663,20 @@ async def api_system_maintenance(body: dict):
             except Exception as exc:
                 failed[iid] = str(getattr(exc, "detail", exc))
         return {"ok": not failed, "action": action, "restarted": restarted, "failed": failed}
-    # Restarting services is the one maintenance action this process cannot perform itself:
-    # it is unprivileged, and in every scope it is itself one of the things being restarted.
+    # Publish one shared request contract. The Pi host orchestrator consumes it externally;
+    # container mode launches its bounded Docker executor after the response has been flushed.
     scope = {"restart_control": "control", "restart_services": "services",
              "restart_host": "host"}.get(action)
     if scope:
         result = await asyncio.to_thread(operations.request_service_restart, scope)
+        if result.get("ok") and operations.container_stack_enabled():
+            async def restart_after_response():
+                # Let Uvicorn flush the accepted response before the Docker daemon stops us.
+                await asyncio.sleep(.75)
+                await asyncio.to_thread(operations.perform_container_service_restart, scope)
+            task = asyncio.create_task(restart_after_response())
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
         return {**result, "action": action}
     raise HTTPException(400, "unknown maintenance action")
 
@@ -4992,13 +5745,26 @@ async def api_support_bundle():
 
 # ----------------------------- instances -----------------------------
 @app.get("/api/instances")
-async def api_instances():
+async def api_instances(request: Request):
     out = []
+    client = gate.current(request).kind == "client"
     for inst in cfg.list_instances():
         st = _cached_line_status(inst)
+        if client:
+            # A client app lists lines to talk on; the line's configuration is not its business.
+            out.append({"id": inst["id"], "name": inst.get("name", ""),
+                        "msisdn": inst.get("msisdn", ""), "enabled": inst.get("enabled", True),
+                        "status": authz.status_for(gate.current(request), st)})
+            continue
         safe = {k: v for k, v in inst.items() if k not in ("pin", "carrier_identity")}
         safe["has_pin"] = bool(inst.get("pin"))
         safe["proxy_country_effective"] = egress.line_country(inst)
+        # What the carrier profile turns on when the line leaves a setting unset, so the form can
+        # show what is actually in effect. Only the switches: a PANI identity is not for display.
+        carrier = cfg.carrier_sip_defaults(str(inst.get("mcc") or ""), str(inst.get("mnc") or ""))
+        safe["sip_carrier_defaults"] = {key: carrier[key] for key in
+                                        (*cfg.CARRIER_SIP_FLAGS, *cfg.CARRIER_SIP_TEXT)
+                                        if key in carrier}
         # Report the reader index that PHYSICALLY holds this line's SIM right now (ICCID-matched
         # against the live monitor) instead of the stored one. PC/SC indices shift when readers
         # are unplugged, so a stored index can be stale and make the SIM-config "Detect card"
@@ -5015,7 +5781,8 @@ async def api_instances():
     return {"instances": out}
 
 
-def _only_instance_name_changed(before: dict | None, after: dict) -> bool:
+def _only_instance_name_changed(before: dict | None, after: dict,
+                                live_binding: dict | None = None) -> bool:
     """Whether a saved edit changed display metadata and no engine configuration.
 
     A line name is resolved by the manager whenever it builds UI, notification or diagnostic
@@ -5023,11 +5790,32 @@ def _only_instance_name_changed(before: dict | None, after: dict) -> bool:
     for a rename only interrupts working calls and tunnels without applying anything useful.
     Compare the persisted documents rather than trusting a client-side flag: a request that also
     changes any operational field must continue through the normal fail-closed rebuild.
+
+    The WebUI sends the whole form back, and two of its fields differ from the stored document
+    without changing anything the engine sees. It pads the MNC to three digits ("15" -> "015"),
+    and the engine pads it the same way wherever it uses it. /api/instances also replaces the
+    stored reader_index/reader_port with the live binding (``live_binding``), which is the
+    binding the running engine already resolves. Either one alone restarted a line on rename.
     """
     if before is None or before == after:
         return False
-    before_runtime = {key: value for key, value in before.items() if key != "name"}
-    after_runtime = {key: value for key, value in after.items() if key != "name"}
+    ignored = cfg.RUNTIME_ONLY_INSTANCE_FIELDS | {"name"}
+    live_binding = live_binding or {}
+
+    def operational(inst: dict) -> dict:
+        fields = {key: value for key, value in inst.items() if key not in ignored}
+        for key in ("mcc", "mnc"):
+            if fields.get(key) not in (None, ""):
+                fields[key] = str(fields[key]).zfill(3)
+        return fields
+
+    before_runtime, after_runtime = operational(before), operational(after)
+    for key, kind in (("reader_index", int), ("reader_port", str)):
+        live = live_binding.get(key)
+        if (isinstance(live, kind) and not isinstance(live, bool)
+                and after_runtime.get(key) == live):
+            before_runtime.pop(key, None)
+            after_runtime.pop(key, None)
     return before_runtime == after_runtime
 
 
@@ -5044,12 +5832,17 @@ async def api_instance_upsert(body: dict):
         raise HTTPException(409, "another line already uses that name")
     previous = cfg.get_instance(iid)
     was_running = await asyncio.to_thread(engine.is_running, iid)
+    live_binding = {}
+    if previous:
+        live_binding = {
+            "reader_index": await asyncio.to_thread(_reader_index_for_instance, previous),
+            "reader_port": await asyncio.to_thread(_reader_port_for_instance, previous)}
     try:
         inst = cfg.upsert_instance(body)
     except cfg.LineLimitError as exc:
         raise HTTPException(409, {
             "code": "line_limit", "message": str(exc)}) from exc
-    name_only_change = _only_instance_name_changed(previous, inst)
+    name_only_change = _only_instance_name_changed(previous, inst, live_binding)
     applied = False
     # A running line holds its config in the engine container (rendered instance.json:
     # WebRTC credentials, IMEI, SMSC, User-Agent, …). Editing the config alone doesn't reach
@@ -5284,11 +6077,11 @@ async def _stop_instance(iid: str, cancel_reason: str) -> dict:
 
 
 @app.get("/api/instances/{iid}/status")
-async def api_instance_status(iid: str):
+async def api_instance_status(iid: str, request: Request):
     inst = cfg.get_instance(iid)
     if not inst:
         raise HTTPException(404, "no such instance")
-    return _cached_line_status(inst)
+    return authz.status_for(gate.current(request), _cached_line_status(inst))
 
 
 def _availability_window(now: int, recorded_since: int | None) -> int:
@@ -5345,10 +6138,284 @@ async def api_instance_register(iid: str):
     return {"output": engine.exec_cli(iid, "pjsip send register volte_ims")}
 
 
+# ----------------------------- address book -----------------------------
+# What one screen of conversations can ask about at once. A larger request is a mistake, or an
+# attempt to read the whole book out through the resolver.
+CONTACT_RESOLVE_LIMIT = 500
+# A 5000-contact vCard export with notes is well under this; it is a ceiling on one request,
+# not a target.
+CONTACT_IMPORT_LIMIT = 4 * 1024 * 1024
+# The fields that travel beside the file. This is all starlette's max_part_size bounds -- a
+# file part is streamed to a spooled temporary file with no limit of its own -- so the file
+# itself is held to the declared body length instead, which is known before anything is read.
+CONTACT_FIELD_LIMIT = 64 * 1024
+
+
+def _owner(request: Request) -> int:
+    """Whose address book this request is about.
+
+    An address book belongs to whoever keeps it, not to the gateway, so the rows carry an
+    owner and every query names one instead of assuming it. This gateway has a single
+    administrator, so that is the answer for every request that gets this far -- the
+    administrator's browser, or a client app signed in with the administrator's credentials.
+    """
+    if gate.current(request).kind not in ("admin", "client"):
+        raise HTTPException(401, "authentication required")
+    return store.ADMIN_OWNER
+
+
+def _line_country(inst: dict) -> str:
+    """The country a number arriving on this line is written for.
+
+    The SIM's own country first: a VoWiFi line reaches its home network wherever the gateway's
+    traffic leaves the internet, and the home network writes a caller's number, and reads a
+    dialled one, by its own numbering plan. The operator's country-exit choice
+    (egress.line_country) answers only while the SIM has not said where it is from.
+    """
+    return egress.country_for_mcc(inst.get("mcc")) or egress.line_country(inst)
+
+
+def _contact_regions() -> tuple[str, ...]:
+    """The countries the gateway has lines in: those a number typed nationally is keyed for."""
+    return contacts.as_regions(_line_country(inst) for inst in cfg.list_instances())
+
+
+# The countries the stored per-country keys were last built for; None until the first
+# address-book request of this process has checked them.
+_contact_keys_for: tuple[str, ...] | None = None
+
+
+def _contact_regions_current() -> tuple[str, ...]:
+    """_contact_regions(), with the stored keys brought up to date for them first.
+
+    The answer changes as lines are added and as a SIM reports where it is, and a number typed
+    in national form was keyed for whatever the answer was then (store.contacts_rekey). It is
+    checked on every address-book request rather than on each configuration change: that costs
+    one comparison, and nothing outside the address book needs to know it exists.
+    """
+    global _contact_keys_for
+    regions = _contact_regions()
+    if regions != _contact_keys_for:
+        store.contacts_rekey(regions)
+        _contact_keys_for = regions
+    return regions
+
+
+class _ContactUploadTooLarge(Exception):
+    pass
+
+
+def _contact_upload(request: Request) -> Request:
+    """The request with its body held to one import's worth of bytes as it is read.
+
+    A declared Content-Length is only an early refusal: a chunked or HTTP/2 upload through a
+    reverse proxy may carry none, and nothing obliges the body to match it. So the bytes are
+    counted as they come off the connection, and reading stops at the first chunk past the
+    limit; starlette closes any temporary file it had begun.
+    """
+    limit = CONTACT_IMPORT_LIMIT + CONTACT_FIELD_LIMIT
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            length = int(declared)
+        except ValueError:
+            raise HTTPException(400, "unreadable Content-Length") from None
+        if length > limit:
+            raise _ContactUploadTooLarge
+    received = 0
+
+    async def receive():
+        nonlocal received
+        message = await request.receive()
+        if message["type"] == "http.request":
+            received += len(message.get("body", b""))
+            if received > limit:
+                raise _ContactUploadTooLarge
+        return message
+
+    return Request(request.scope, receive)
+
+
+def _line_region(iid: str, regions: tuple[str, ...]) -> str:
+    """The country a number arriving on this line is national to, or "" when unknown.
+
+    Without a line there is still an answer when the gateway is in one country only.
+    """
+    if iid:
+        return _line_country(cfg.get_instance(str(iid)) or {})
+    return regions[0] if len(regions) == 1 else ""
+
+
+@app.get("/api/contacts")
+async def api_contacts(request: Request, query: str = "", limit: int = 1000):
+    owner = _owner(request)
+    regions = await asyncio.to_thread(_contact_regions_current)
+    items = await asyncio.to_thread(store.contacts_list, owner, query,
+                                    max(1, min(int(limit), 2000)), regions)
+    return {"contacts": items, "total": await asyncio.to_thread(store.contacts_count, owner)}
+
+
+@app.post("/api/contacts")
+async def api_contact_create(body: dict, request: Request):
+    try:
+        owner = _owner(request)
+        regions = await asyncio.to_thread(_contact_regions_current)
+        return {"contact": await asyncio.to_thread(store.contact_create, owner, body, regions)}
+    except contacts.ContactError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.put("/api/contacts/{contact_id}")
+async def api_contact_update(contact_id: int, body: dict, request: Request):
+    try:
+        owner = _owner(request)
+        regions = await asyncio.to_thread(_contact_regions_current)
+        updated = await asyncio.to_thread(store.contact_update, owner, int(contact_id), body,
+                                          regions)
+    except contacts.ContactError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if updated is None:
+        raise HTTPException(404, "no such contact")
+    return {"contact": updated}
+
+
+@app.delete("/api/contacts/{contact_id}")
+async def api_contact_delete(contact_id: int, request: Request):
+    if not await asyncio.to_thread(store.contact_delete, _owner(request), int(contact_id)):
+        raise HTTPException(404, "no such contact")
+    return {"ok": True}
+
+
+@app.post("/api/contacts/resolve")
+async def api_contacts_resolve(body: dict, request: Request):
+    """Name the numbers on one screen at once, so a conversation list is one extra request.
+
+    `line` says which line they arrived on, because a number written in national form is
+    national to that line's country and to no other. Without it the gateway's country stands in
+    when it has lines in only one; otherwise only an international spelling can be recognised.
+    """
+    owner = _owner(request)
+    numbers = [str(n) for n in (body.get("numbers") or [])][:CONTACT_RESOLVE_LIMIT]
+    regions = await asyncio.to_thread(_contact_regions_current)   # keys current first
+    region = await asyncio.to_thread(_line_region, str(body.get("line") or ""), regions)
+    return {"contacts": await asyncio.to_thread(store.contacts_resolve, owner, numbers, region)}
+
+
+def _contact_file(raw: bytes, filename: str) -> tuple[list[dict], list[str]]:
+    # Phone exports are UTF-8 or a local code page; a byte that fits neither is replaced rather
+    # than failing the whole import, so one bad character cannot cost three hundred contacts.
+    return contacts.parse(raw.decode("utf-8", errors="replace"), filename)
+
+
+@app.post("/api/contacts/import")
+async def api_contacts_import(request: Request):
+    """Import a vCard or CSV export (multipart field "file", or a JSON body with "text")."""
+    owner = _owner(request)
+    too_large = HTTPException(413, f"the file is larger than {CONTACT_IMPORT_LIMIT // 1024} KB")
+    filename, raw = "", b""
+    try:
+        counted = _contact_upload(request)
+        if "multipart/form-data" in (request.headers.get("content-type") or ""):
+            try:
+                form = await counted.form(max_files=1, max_fields=8,
+                                          max_part_size=CONTACT_FIELD_LIMIT)
+            except _ContactUploadTooLarge:
+                raise
+            except Exception as exc:  # noqa
+                raise HTTPException(422, f"unreadable upload: {exc}") from None
+            try:
+                upload = form.get("file")
+                if not hasattr(upload, "read"):
+                    raise HTTPException(422, "no file")
+                filename = upload.filename or ""
+                raw = await upload.read(CONTACT_IMPORT_LIMIT + 1)
+            finally:
+                # A form parsed here rather than by FastAPI is not closed for us.
+                await form.close()
+        else:
+            try:
+                body = await counted.json()
+            except ValueError:
+                raise HTTPException(400, "the body is not JSON") from None
+            if not isinstance(body, dict):
+                raise HTTPException(400, "the body must be a JSON object")
+            filename = str(body.get("filename") or "")
+            raw = str(body.get("text") or "").encode("utf-8")
+    except _ContactUploadTooLarge:
+        raise too_large from None
+    if len(raw) > CONTACT_IMPORT_LIMIT:
+        raise too_large
+    try:
+        # Reading a file of this size takes long enough that it must not hold up the event loop,
+        # which carries every call and message on the gateway.
+        parsed, problems = await asyncio.to_thread(_contact_file, raw, filename)
+        regions = await asyncio.to_thread(_contact_regions_current)
+        result = await asyncio.to_thread(store.contacts_import, owner, parsed, regions)
+    except contacts.ContactError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {**result, "read": len(parsed), "problems": problems[:50]}
+
+
+@app.get("/api/contacts/export")
+async def api_contacts_export(request: Request, format: str = "vcf"):
+    owner = _owner(request)
+    items = await asyncio.to_thread(store.contacts_list, owner, "",
+                                    contacts.MAX_CONTACTS_PER_OWNER)
+    if str(format).lower() in ("csv", "text/csv"):
+        body, media, name = contacts.to_csv(items), "text/csv; charset=utf-8", "contacts.csv"
+    else:
+        body, media, name = contacts.to_vcard(items), "text/vcard; charset=utf-8", "contacts.vcf"
+    return Response(content=body.encode("utf-8"), media_type=media,
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
 # ----------------------------- SMS -----------------------------
 @app.get("/api/instances/{iid}/messages/threads")
 def api_threads(iid: str):
     return {"threads": store.list_threads(iid)}
+
+
+# Declared before /messages/{peer}: a path parameter would otherwise swallow "unread" and
+# answer with the conversation with somebody called that.
+@app.get("/api/instances/{iid}/messages/unread")
+async def api_messages_unread(iid: str, request: Request):
+    """Which conversations on this line have not been read, and how many messages each."""
+    owner = _owner(request)
+    counts = await asyncio.to_thread(store.unread_counts, owner, str(iid))
+    return {"unread": counts, "total": sum(counts.values())}
+
+
+@app.post("/api/instances/{iid}/messages/read")
+async def api_messages_read(iid: str, body: dict, request: Request):
+    """Mark one conversation read, or the whole line.
+
+    A client's first run marks the line read: an upgrade must not present years of history as
+    unread. Afterwards it marks each conversation as the person opens it.
+    """
+    owner = _owner(request)
+    message_id = body.get("message_id")
+    if message_id is not None:
+        try:
+            message_id = int(message_id)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "message_id must be a message id") from None
+    if body.get("all"):
+        position = await asyncio.to_thread(store.mark_line_read, owner, str(iid), message_id)
+        return {"ok": True, "line": str(iid), "last_read_id": position}
+    peer = str(body.get("peer") or "").strip()
+    if not peer:
+        raise HTTPException(400, "provide peer or all")
+    position = await asyncio.to_thread(store.mark_thread_read, owner, str(iid), peer,
+                                       message_id)
+    return {"ok": True, "peer": peer, "last_read_id": position}
+
+
+@app.get("/api/messages/unread")
+async def api_messages_unread_total(request: Request):
+    """One number for a badge, across every line."""
+    owner = _owner(request)
+    lines = [str(inst.get("id")) for inst in cfg.list_instances()]
+    return {"total": await asyncio.to_thread(store.unread_total, owner, lines), "lines": lines}
 
 
 @app.get("/api/instances/{iid}/messages/binary")
@@ -5371,11 +6438,12 @@ def api_messages(iid: str, peer: str):
     return {"messages": store.list_messages(iid, peer)}
 
 
-@app.post("/api/instances/{iid}/mms/send")
-async def api_mms_send(iid: str, request: Request):
-    """Compose and submit an MMS. multipart/form-data: to (comma-separated), text, subject,
-    and any number of `attachments` files. Returns at once with the stored message; the
-    upload itself can take minutes over the modem and is reported over the websocket."""
+# Largest file accepted as picked: a camera original is often several megabytes and is
+# converted and shrunk here to fit the line's limit (mms.fit_attachments).
+MMS_UPLOAD_LIMIT = 25 * 1024 * 1024
+
+
+async def _mms_line(iid: str) -> tuple[dict, dict]:
     inst = await asyncio.to_thread(cfg.get_instance, iid)
     if not inst:
         raise HTTPException(404, "no such line")
@@ -5384,31 +6452,230 @@ async def api_mms_send(iid: str, request: Request):
         raise HTTPException(409, "MMS is turned off for this line")
     if not settings.get("configured"):
         raise HTTPException(409, "no MMSC is known for this line's carrier")
+    return inst, settings
+
+
+# Largest of the fields that travel with an attachment -- the text, subject and recipients.
+# This is all starlette's ``max_part_size`` bounds: a file part is streamed straight to a
+# spooled temporary file with no limit of its own, so passing the upload limit here raised the
+# ceiling on the fields and did nothing whatever for the files.
+MMS_FIELD_LIMIT = 256 * 1024
+
+
+class _BodyTooLarge(Exception):
+    pass
+
+
+def _spool_upload(*args, **kwargs):
+    """Where starlette puts an uploaded file once it passes 1 MB: under the data directory.
+
+    starlette gives no way to choose, so tempfile's default applies -- /tmp, which in the
+    control container is a 32 MB tmpfs, less than one /mms/send request may carry, and shared
+    by every upload in flight. The files are unnamed (O_TMPFILE, or unlinked at once where that
+    is missing), so a process that dies leaves nothing behind."""
+    directory = os.path.join(store.DATA_DIR, "uploads")
+    os.makedirs(directory, exist_ok=True)
+    kwargs.setdefault("dir", directory)
+    return tempfile.SpooledTemporaryFile(*args, **kwargs)
+
+
+starlette_formparsers.SpooledTemporaryFile = _spool_upload
+
+
+def _limited_request(request: Request, limit: int) -> Request:
+    """The request with its body held to `limit` bytes as it is read.
+
+    A file part is measured only once it has been spooled to disk, which is too late to be a
+    limit, and a declared Content-Length is not one either: a chunked or HTTP/2 upload through
+    a reverse proxy may carry none, and nothing obliges the body to match it. So the bytes are
+    counted as the parser pulls them off the connection, and reading stops at the first chunk
+    that goes past the limit; starlette then closes the temporary files it had begun. A
+    declared length that is already too large is refused before anything is read."""
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            length = int(declared)
+        except ValueError:
+            raise HTTPException(400, "unreadable Content-Length") from None
+        if length > limit:
+            raise _too_large(limit)
+    received = 0
+
+    async def receive():
+        nonlocal received
+        message = await request.receive()
+        if message["type"] == "http.request":
+            received += len(message.get("body", b""))
+            if received > limit:
+                raise _BodyTooLarge
+        return message
+
+    return Request(request.scope, receive)
+
+
+def _too_large(limit: int) -> HTTPException:
+    return HTTPException(413, f"the request is larger than {limit // (1024 * 1024)} MB")
+
+
+async def _mms_form(request: Request, *, files: int, limit: int):
+    limited = _limited_request(request, limit)
     try:
-        form = await request.form(max_files=20, max_fields=20,
-                                  max_part_size=int(settings["max_size"]) + 1024)
+        return await limited.form(max_files=files, max_fields=40,
+                                  max_part_size=MMS_FIELD_LIMIT)
+    except _BodyTooLarge:
+        raise _too_large(limit) from None
     except Exception as exc:  # noqa
         raise HTTPException(413 if "size" in str(exc).lower() else 422,
                             f"unreadable MMS form: {exc}") from None
-    recipients = mms.parse_recipients(form.get("to") or "")
-    text = str(form.get("text") or "")
-    subject = str(form.get("subject") or "").strip()[:80]
-    attachments = []
-    for upload in form.getlist("attachments"):
+
+
+async def _read_upload(upload) -> dict:
+    data = await upload.read(MMS_UPLOAD_LIMIT + 1)
+    if len(data) > MMS_UPLOAD_LIMIT:
+        raise HTTPException(413, f"{upload.filename or 'the file'} is larger than "
+                                 f"{MMS_UPLOAD_LIMIT // (1024 * 1024)} MB")
+    return {"name": upload.filename or "", "content_type": upload.content_type or "",
+            "data": data}
+
+
+def _recipient_list(value) -> list[str]:
+    return mms.parse_recipients(value or "")
+
+
+def _staged_ids(values) -> list[str]:
+    """The staged attachments a request names, refused when there are more than a line can
+    hold. Every id is loaded into memory to be fitted, so an unbounded list is a way to ask
+    the gateway to read the same 25 MB upload a thousand times over."""
+    ids = [str(i) for i in values or [] if str(i)]
+    if len(ids) > mms_staging.MAX_PER_LINE:
+        raise HTTPException(400, f"at most {mms_staging.MAX_PER_LINE} attachments can be sent "
+                                 f"in one request")
+    return ids
+
+
+@app.post("/api/instances/{iid}/mms/attachments")
+async def api_mms_attachment_add(iid: str, request: Request):
+    """Upload one attachment while composing (multipart field "file"). It is checked at once
+    -- a format the gateway will not send is refused here, not at sending time -- and kept
+    as the original until the MMS is sent or the attachment removed."""
+    await _mms_line(iid)
+    form = await _mms_form(request, files=1, limit=MMS_UPLOAD_LIMIT + MMS_FIELD_LIMIT)
+    try:
+        upload = form.get("file")
         if not hasattr(upload, "read"):
-            continue
-        data = await upload.read(int(settings["max_size"]) + 1)
-        attachments.append({"name": os.path.basename(upload.filename or "")[:80],
-                            "content_type": upload.content_type or "", "data": data})
-    problem = await asyncio.to_thread(mms.validate_outgoing, recipients, text, attachments,
-                                      settings, subject)
+            raise HTTPException(422, "no file")
+        item = await _read_upload(upload)
+    finally:
+        # A form parsed here rather than by FastAPI is not closed for us.
+        await form.close()
+    _checked, problem = await asyncio.to_thread(mms.check_attachments, [item], convert=True)
     if problem:
         raise HTTPException(422, problem)
-    rec = await asyncio.to_thread(mms.create_outgoing, iid, recipients, text, attachments,
-                                  subject)
-    await hub.broadcast({"type": "sms", "instance": str(iid), "message": rec})
-    asyncio.create_task(_send_mms_task(str(iid), int(rec["id"])))
-    return {"ok": True, "message": rec}
+    try:
+        meta = await asyncio.to_thread(mms_staging.stage, iid, item["name"],
+                                       item["content_type"], item["data"])
+    except OverflowError as exc:
+        raise HTTPException(409, str(exc)) from None
+    return {"ok": True, "attachment": meta}
+
+
+@app.post("/api/instances/{iid}/mms/attachments/fit")
+async def api_mms_attachments_fit(iid: str, body: dict):
+    """What sending would carry: body {ids, text, subject, to, split}. Converts and shrinks the
+    staged attachments to fit the line's limit -- together in one message, or with `split`
+    each in its own -- and reports each one's size before and after, a preview version token,
+    and each message's packaged size (see mms.plan_messages). Sending fits again."""
+    _inst, settings = await _mms_line(iid)
+    body = body or {}
+    ids = _staged_ids(body.get("ids"))
+    try:
+        items = await asyncio.to_thread(mms_staging.load, iid, ids)
+    except KeyError as exc:
+        raise HTTPException(404, f"no such attachment: {exc.args[0]}") from None
+    messages, problem, summary = await asyncio.to_thread(
+        mms.plan_messages, items, str(body.get("text") or ""),
+        str(body.get("subject") or "").strip()[:80], _recipient_list(body.get("to")), settings,
+        split=bool(body.get("split")))
+    fitted = [part for message in messages for part in message["attachments"]]
+    for attachment_id, part, entry in zip(ids, fitted, summary.get("attachments") or []):
+        entry["id"] = attachment_id
+        entry["preview"] = await asyncio.to_thread(
+            mms_staging.save_fitted, iid, attachment_id, part["content_type"], part["data"])
+    return {"ok": problem is None, "problem": problem, **summary}
+
+
+@app.get("/api/instances/{iid}/mms/attachments/{aid}/preview")
+def api_mms_attachment_preview(iid: str, aid: str, v: str | None = None):
+    """A staged attachment as the composer shows it; `v` names a fitted version (the
+    "preview" token a fit returned), so a thumbnail never shows another mode's version."""
+    found = mms_staging.preview_file(iid, aid, v or None)
+    if not found:
+        raise HTTPException(404, "no such attachment")
+    path, content_type = found
+    if not mms_media.previewable(content_type) or not content_type.startswith("image/"):
+        raise HTTPException(415, "no preview for this attachment")
+    return FileResponse(path, media_type=content_type,
+                        headers={"X-Content-Type-Options": "nosniff",
+                                 "Content-Security-Policy": "sandbox; default-src 'none'",
+                                 # A version token names fixed content; without one the
+                                 # latest version is served, which a later fit replaces.
+                                 "Cache-Control": "private, max-age=3600" if v else "no-store"})
+
+
+@app.delete("/api/instances/{iid}/mms/attachments/{aid}")
+async def api_mms_attachment_remove(iid: str, aid: str):
+    await asyncio.to_thread(mms_staging.remove, iid, [aid])
+    return {"ok": True}
+
+
+@app.post("/api/instances/{iid}/mms/send")
+async def api_mms_send(iid: str, request: Request):
+    """Compose and submit MMS. multipart/form-data: to (comma-separated), text, subject, any
+    number of `attachment_ids` (uploaded with POST .../mms/attachments) and/or `attachments`
+    files, and `split` ("1" to send each attachment as its own MMS, the text and subject with
+    the first). Every attachment is converted and shrunk to fit the line's limit. Returns at
+    once with the stored messages ("message" is the first); the upload to the MMSC can take
+    minutes over the modem and is reported over the websocket."""
+    _inst, settings = await _mms_line(iid)
+    # Attachments sent directly, rather than staged first, are held to the same budget the
+    # staging area gives a line: one request can never carry more than the line may hold.
+    form = await _mms_form(request, files=mms_staging.MAX_PER_LINE,
+                           limit=mms_staging.MAX_BYTES_PER_LINE + MMS_FIELD_LIMIT)
+    try:
+        recipients = _recipient_list(form.get("to"))
+        text = str(form.get("text") or "")
+        subject = str(form.get("subject") or "").strip()[:80]
+        split = str(form.get("split") or "").lower() in ("1", "true", "yes")
+        staged_ids = _staged_ids(form.getlist("attachment_ids"))
+        try:
+            attachments = await asyncio.to_thread(mms_staging.load, iid, staged_ids)
+        except KeyError as exc:
+            raise HTTPException(404, f"no such attachment: {exc.args[0]}") from None
+        for upload in form.getlist("attachments"):
+            if hasattr(upload, "read"):
+                attachments.append(await _read_upload(upload))
+    finally:
+        await form.close()
+    messages, problem, _summary = await asyncio.to_thread(
+        mms.prepare_outgoing, recipients, text, attachments, settings, subject, split=split)
+    if problem:
+        raise HTTPException(422, problem)
+    records = []
+    for message in messages:
+        records.append(await asyncio.to_thread(
+            mms.create_outgoing, iid, recipients, message["text"], message["attachments"],
+            message["subject"]))
+    await asyncio.to_thread(mms_staging.remove, iid, staged_ids)
+    for rec in records:
+        await hub.broadcast({"type": "sms", "instance": str(iid), "message": rec})
+    asyncio.create_task(_send_mms_sequence(str(iid), [int(r["id"]) for r in records]))
+    return {"ok": True, "message": records[0], "messages": records}
+
+
+async def _send_mms_sequence(iid: str, mids: list[int]) -> None:
+    """Submit several MMS one after another, so they reach the recipient in order."""
+    for mid in mids:
+        await _send_mms_task(iid, mid)
 
 
 async def _send_mms_task(iid: str, mid: int) -> None:
@@ -5475,7 +6742,7 @@ def _mms_settings_view(inst: dict) -> dict:
                                  if k != "password"}
     own = dict(inst.get("mms") or {})
     own["password_set"] = bool(own.pop("password", ""))
-    return {"effective": effective, "line": own}
+    return {"effective": effective, "line": own, "formats": mms.attachment_formats()}
 
 
 @app.get("/api/instances/{iid}/mms/settings")
@@ -6191,7 +7458,7 @@ def api_keepalive_save(iid: str, body: dict):
 
 @app.get("/api/keepalive/summary")
 async def api_keepalive_summary():
-    """One aggregate for the whole page: at most five lines, so a per-line fan-out of four
+    """One aggregate for the whole page: at most ten lines, so a per-line fan-out of four
     requests each would be pure overhead."""
     now = int(time.time())
     rows = []
@@ -6458,6 +7725,13 @@ def api_softphone(iid: str, request: Request):
     sip = inst.get("sip", {}) or {}
     wr = sip.get("webrtc", {}) or {}
     host = (request.headers.get("host") or "").split(":")[0] or request.url.hostname
+    # Media: nothing in direct mode (the engine's published RTP ports); in relay mode the TURN
+    # relay with fresh credentials, which clients re-read before every call. The relay is
+    # named by the host the client reached this API by, unless the operator set another.
+    media_prov = media.provisioning(str(iid), request.url.hostname or host)
+    if media_prov["media_mode"] == media.RELAY:
+        media_prov["relay_ready"] = bool(media_prov["relay_ready"]) and \
+            _line_media_state(str(iid)) == "ready"
     return {
         "enabled": bool(wr.get("enable", True)),
         "username": wr.get("username", "webrtc"),
@@ -6466,19 +7740,50 @@ def api_softphone(iid: str, request: Request):
         "ws_path": softphone_ws.path(iid),
         "host": host,
         "realm": cfg.ims_realm(inst["mcc"], inst["mnc"]),
+        **media_prov,
     }
+
+
+@app.get("/api/media")
+def api_media():
+    """The media mode and the relay's state, for display. The mode is switched by the
+    installer (install.sh media), since it rebuilds every line."""
+    state = media.load_state()
+    current = media.mode(state)
+    result = {"mode": current, "relay": media.relay_status()}
+    if current == media.RELAY:
+        lines, line_filters = {}, {}
+        for iid in (str(inst["id"]) for inst in cfg.list_instances()):
+            line_mode = engine.media_mode_of(iid)
+            if line_mode == media.RELAY_PENDING:
+                lines[iid] = "no_media_network"
+            elif line_mode == media.RELAY:
+                report = _line_media_report(iid)
+                lines[iid] = str(report.get("state") or "starting")
+                # What the engine actually loaded; absent from engines older than the
+                # iptables-legacy fallback, and while the line is still starting.
+                line_filters[iid] = str(report.get("filter") or "")
+        kind = media.recorded_filter(state)
+        result.update({
+            "port": state.get("port"),
+            "public_host": state.get("public_host") or "",
+            "public_port": state.get("public_port"),
+            "lines": lines,
+            # The engines' media filter, as probed when relay mode was enabled, and whether it
+            # tells the browser leg from the IMS leg (iptables-legacy goes by port only).
+            "filter": kind,
+            "filter_separates_legs": media.filter_separates_legs(kind),
+            "line_filters": line_filters,
+        })
+    return result
 
 
 @app.websocket("/api/instances/{iid}/softphone/ws")
 async def ws_softphone(ws: WebSocket, iid: str):
     """The browser softphone's SIP-over-WebSocket, relayed to the line's engine.
 
-    WebSocket handshakes bypass the HTTP middleware, so the session check is repeated here.
-    The session cookie is SameSite=Strict, so a cross-site page cannot open this socket as the
-    admin. Rejections close before accepting (the browser sees a failed handshake)."""
-    if not auth.session(ws.cookies.get(auth.SESSION_COOKIE)):
-        await ws.close(code=4401)
-        return
+    The session and the page's origin are checked by the gateway middleware before this runs
+    (gate.py). Rejections close before accepting (the browser sees a failed handshake)."""
     inst = cfg.get_instance(iid)
     webrtc = ((inst or {}).get("sip") or {}).get("webrtc") or {}
     if not inst or not webrtc.get("enable", True) or \
@@ -6649,14 +7954,17 @@ async def api_engine_event(payload: dict):
                              "message %d", seq, total, sender, ref, late["message_id"])
                     return {"ok": True, "merged": "duplicate"}
                 merged = _join_sms_parts(late["bodies"], late["seqs"], total)
-                rec = await asyncio.to_thread(store.set_message_body, late["message_id"],
-                                              merged)
+                rec = await asyncio.to_thread(
+                    store.set_message_body, late["message_id"], merged,
+                    int(time.time()) if late["complete"] else None)
                 log.info("late part %d/%d from %s (ref %d) merged into message %d — %s",
                          seq, total, sender, ref, late["message_id"],
                          "now complete" if late["complete"]
                          else f"{len(late['seqs'])}/{total} parts")
                 if rec:
                     await hub.broadcast({"type": "sms", "instance": iid, "message": rec})
+                    if late["complete"]:
+                        await _publish_completed_sms(rec)
                 return {"ok": True, "merged": f"{len(late['seqs'])}/{total}"}
             group = await asyncio.to_thread(store.add_sms_segment, iid, sender, ref, total,
                                             seq, text, sent_ts=sent_ts, with_meta=True)
@@ -7348,21 +8656,8 @@ async def api_esim_notification_remove(
 # ----------------------------- WebSocket -----------------------------
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
-    # Accept before the application-level close so browsers receive code 4401 instead of
-    # treating the rejected handshake as an opaque HTTP 403 and reconnecting forever.
+    # Signed-out browsers are closed with 4401 by the gateway middleware (gate.py).
     await ws.accept()
-    if not auth.session(ws.cookies.get(auth.SESSION_COOKIE)):
-        if ws.query_params.get("auth_close") == "1":
-            await ws.close(code=4401)
-        else:
-            # A tab loaded before this fix does not understand 4401 and reconnects every two
-            # seconds after any close. Keep that unauthenticated legacy socket out of the hub
-            # but quietly open until the user reloads or closes the tab.
-            try:
-                await ws.receive_text()
-            except Exception:
-                pass
-        return
     hub.clients.add(ws)
     try:
         while True:
@@ -7374,8 +8669,29 @@ async def ws_endpoint(ws: WebSocket):
 
 
 # ----------------------------- static WebUI -----------------------------
+# The page that names which build to load must be revalidated every time; the files it names
+# never change, because their names contain a hash of their contents.
+#
+# Without this the upgrade does not arrive. The answers carry an ETag but no Cache-Control, so a
+# client is free to guess how long they stay fresh -- and a WebView, which has no reload button,
+# can keep showing the previous build until its cache is evicted. That looks exactly like an
+# upgrade that did not apply.
+INDEX_CACHE_CONTROL = "no-cache"
+ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+
+class _HashedAssets(StaticFiles):
+    """Static files whose names carry a content hash, so a name maps to one immutable body."""
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = ASSET_CACHE_CONTROL
+        return response
+
+
 if os.path.isdir(WEBUI_DIR):
-    app.mount("/assets", StaticFiles(directory=os.path.join(WEBUI_DIR, "assets")), name="assets")
+    app.mount("/assets", _HashedAssets(directory=os.path.join(WEBUI_DIR, "assets")),
+              name="assets")
 
     @app.get("/{full_path:path}")
     def spa(full_path: str):
@@ -7385,8 +8701,10 @@ if os.path.isdir(WEBUI_DIR):
             return JSONResponse({"detail": "API endpoint not found"}, status_code=404)
         candidate = os.path.join(WEBUI_DIR, full_path)
         if full_path and os.path.isfile(candidate):
-            return FileResponse(candidate)
+            # Everything else at the root -- the logo, the icons -- is small, rarely changed and
+            # not hashed, so it revalidates like the page itself.
+            return FileResponse(candidate, headers={"Cache-Control": INDEX_CACHE_CONTROL})
         index = os.path.join(WEBUI_DIR, "index.html")
         if os.path.isfile(index):
-            return FileResponse(index)
+            return FileResponse(index, headers={"Cache-Control": INDEX_CACHE_CONTROL})
         return JSONResponse({"error": "webui not built"}, status_code=404)

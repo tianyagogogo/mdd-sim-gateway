@@ -19,6 +19,8 @@ import requests
 import hashlib
 import ipaddress
 
+from outer_transport import proxy_udp_socket
+
 # Python 3.14 changed POSIX multiprocessing's default from fork to forkserver.  The SWu data
 # plane workers intentionally inherit the live IKE/crypto state; serialising that state is both
 # unnecessary and impossible (cryptography's DHParameterNumbers is not picklable).  Keep the
@@ -153,6 +155,7 @@ SWU_IFACE = os.environ.get("SWU_IFACE", "ipsec0")          # tun device name (pj
 SWU_NOTIFY = os.environ.get("SWU_NOTIFY", "/usr/local/bin/notify.py")
 SWU_ASSIGN_IPV6_GLOBAL = os.environ.get("SWU_ASSIGN_IPV6_GLOBAL", "1") not in ("0", "", "no")
 SWU_WRITE_RESOLV = os.environ.get("SWU_WRITE_RESOLV", "0") not in ("0", "", "no")
+SWU_EGRESS_PROXY = os.environ.get("SWU_EGRESS_PROXY", "").strip()
 
 # --- Data-plane MTU / fragmentation handling -------------------------------------------------
 # The userspace ESP dataplane reads inner IP packets off the tun (ipsec0), wraps each in
@@ -972,6 +975,9 @@ class swu():
         self.imsi = imsi
         
         self.netns_name = netns
+        self.egress_proxy = SWU_EGRESS_PROXY
+        # SOCKS5 UDP carries an IPv4 destination as RSV/FRAG/ATYP/DST.ADDR/DST.PORT.
+        self.proxy_udp_overhead = 10 if self.egress_proxy else 0
         
         self.set_variables()
         self.set_udp() # default
@@ -1352,13 +1358,19 @@ class swu():
         self.socket_type = UDP
 
     def create_socket(self,client_address):
-        
+
         if self.socket_type == UDP:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if self.egress_proxy:
+                self.socket = proxy_udp_socket(
+                    self.egress_proxy, self.server_address,
+                    source=client_address, timeout=self.timeout)
+            else:
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         else:
             exit()
-            
-        self.socket.bind(client_address)                
+
+        if not self.egress_proxy:
+            self.socket.bind(client_address)
         self.socket.settimeout(self.timeout)
         self._enable_outer_pmtud(self.socket)
 
@@ -1366,17 +1378,29 @@ class swu():
     def create_socket_nat(self,client_address):
         
         if self.socket_type == UDP:
-            self.socket_nat = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if self.egress_proxy:
+                self.socket_nat = proxy_udp_socket(
+                    self.egress_proxy, self.server_address_nat,
+                    source=client_address, timeout=self.timeout)
+            else:
+                self.socket_nat = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         else:
             exit()
-            
-        self.socket_nat.bind(client_address)                
+
+        if not self.egress_proxy:
+            self.socket_nat.bind(client_address)
         self.socket_nat.settimeout(self.timeout)
         self._enable_outer_pmtud(self.socket_nat)
 
     def create_socket_esp(self,client_address):
-        self.socket_esp = socket.socket(socket.AF_INET, socket.SOCK_RAW, ESP_PROTOCOL)
-        self.socket_esp.bind(client_address)    
+        if self.egress_proxy:
+            # SOCKS5 has no raw-IP transport.  Keep a selectable, unreachable local socket
+            # for the existing worker loop; every real packet is forced to UDP/4500 below.
+            self.socket_esp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket_esp.bind(("127.0.0.1", 0))
+        else:
+            self.socket_esp = socket.socket(socket.AF_INET, socket.SOCK_RAW, ESP_PROTOCOL)
+            self.socket_esp.bind(client_address)
         self._enable_outer_pmtud(self.socket_esp)
 
     def _enable_outer_pmtud(self, sock):
@@ -2620,7 +2644,7 @@ class swu():
 
     def _inner_mtu_from(self, outer_mtu):
         """Largest inner IP packet whose ESP encapsulation fits one outer datagram of outer_mtu."""
-        m = outer_mtu - self._esp_overhead() - SWU_MTU_MARGIN
+        m = outer_mtu - self._esp_overhead() - self.proxy_udp_overhead - SWU_MTU_MARGIN
         return m if m >= 68 else 68
 
     def _compute_and_apply_tun_mtu(self):
@@ -2840,10 +2864,14 @@ class swu():
             self.exec_in_netns("ip addr add " + self.ip_address_list[0] + "/32 dev " + self.tun_device)
             #set host route, only  required if no netns
             if not self.netns_name:
-                if self.default_gateway is None:
-                    self.exec_in_netns("route add " + self.server_address[0] + "/32 gw " + self.get_default_gateway_linux()[0])
+                # Behind a country exit the Engine sits on an internal network with no default
+                # route: IKE and ESP reach the ePDG through the SOCKS proxy on that network's own
+                # subnet, which the /1 tunnel routes below never cover, so there is nothing to pin.
+                gateway = self.default_gateway or (self.get_default_gateway_linux() or [None])[0]
+                if gateway:
+                    self.exec_in_netns("route add " + self.server_address[0] + "/32 gw " + gateway)
                 else:
-                    self.exec_in_netns("route add " + self.server_address[0] + "/32 gw " + self.default_gateway)
+                    swu_log("no default route (proxied egress): ePDG host route not needed")
 
             # VoWiFi engine addition: on an IPv4 IMS PDN (e.g. Vodafone UK, cp_mode=v4) the two /1
             # routes below make the tunnel the default route for ALL IPv4. That blackholes every
@@ -2983,8 +3011,10 @@ class swu():
       
 
     def get_default_source_address(self):
-    
-        proc = subprocess.Popen("/sbin/ifconfig | grep -A 1 " + get_default_gateway_linux()[1] + " | grep inet", stdout=subprocess.PIPE, shell=True)
+        gateway = get_default_gateway_linux()
+        if not gateway:
+            return None
+        proc = subprocess.Popen("/sbin/ifconfig | grep -A 1 " + gateway[1] + " | grep inet", stdout=subprocess.PIPE, shell=True)
         output = str(proc.stdout.read())
         if 'addr:' in output:
             addr = output.split('addr:')[1].split()[0]
@@ -3163,7 +3193,7 @@ class swu():
         cur = getattr(self, "inner_mtu", 0) or (SWU_TUN_MTU_ENV or 1400)
         new_inner = None
         if outer:
-            candidate = outer - overhead - SWU_MTU_MARGIN
+            candidate = outer - overhead - self.proxy_udp_overhead - SWU_MTU_MARGIN
             if candidate < cur:
                 new_inner = candidate
         if new_inner is None:
@@ -4327,6 +4357,10 @@ class swu():
                         swu_log("ePDG supports IKEv2 fragmentation (RFC 7383)")
                         
             self.generate_keying_material()
+            if self.egress_proxy:
+                # The relay necessarily changes the outer source address.  Force RFC 3948
+                # encapsulation even if a non-conforming peer omitted NAT detection payloads.
+                self.userplane_mode = NAT_TRAVERSAL
             
             
             return OK,''
@@ -5973,8 +6007,13 @@ def get_default_gateway_linux():
             return socket.inet_ntoa(struct.pack("<L", int(fields[2], 16))), fields[0]
 
 def get_default_source_address():
-
-    proc = subprocess.Popen("/sbin/ifconfig | grep -A 1 " + get_default_gateway_linux()[1] + " | grep inet", stdout=subprocess.PIPE, shell=True)
+    # Evaluated eagerly as the -s default, even when -s is given. A container Engine behind a
+    # country exit sits on an internal Docker network with no default route, and this used to
+    # raise TypeError before the entrypoint's -s could apply, so the line never started.
+    gateway = get_default_gateway_linux()
+    if not gateway:
+        return None
+    proc = subprocess.Popen("/sbin/ifconfig | grep -A 1 " + gateway[1] + " | grep inet", stdout=subprocess.PIPE, shell=True)
     output = str(proc.stdout.read())
     if 'addr:' in output:
         addr = output.split('addr:')[1].split()[0]
@@ -6777,6 +6816,8 @@ def main():
                              iccid=_foreign, expected=_want_iccid)
             exit(1)
 
+    if not options.source_addr:
+        parser.error("no IKE source address: pass -s, the host has no default route to derive one")
     a = swu(options.source_addr,destination_addr,options.apn,modem,options.gateway_ip_address,options.mcc,options.mnc,options.imsi,options.netns)
 
     if options.imsi == DEFAULT_IMSI: a.get_identity()

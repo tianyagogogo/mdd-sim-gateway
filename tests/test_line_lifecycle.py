@@ -685,8 +685,9 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.cfg, "get_settings", return_value={
                     "proxy": {"exits": {}}, "rekey": {"minutes": 30}}), \
                 patch.object(main, "_cached_line_status", return_value=None), \
-                patch.object(main.egress, "status", return_value={"lines": {}}), \
-                patch.object(main.egress, "line_country", return_value="GB"), \
+                patch.object(main.egress, "status", return_value={
+                    "exits": {"gb": {"ready": True, "node": "London container exit"}}}), \
+                patch.object(main.egress, "line_country", return_value="gb"), \
                 patch.object(main.egress, "country_for_mcc", return_value="GB"):
             devices = await main._unified_devices()
 
@@ -698,6 +699,41 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(device["sim"]["carrier"]["plmn"], "234-10")
         self.assertEqual(device["instance_id"], "3")
         self.assertEqual(device["capabilities"]["cellular"]["actual"], "on")
+        self.assertEqual(device["egress"]["node"], "London container exit")
+
+    async def test_modem_with_working_4g_and_a_carrier_without_vowifi(self):
+        """The device-wide VoWiFi switch stayed on over a line provisioned disabled, so a
+        China Telecom SIM with working 4G read "enabled but no configured line is running"."""
+        desired = {"devices": {"modem-a": {
+            "cellular_enabled": True, "vowifi_enabled": True, "flight_mode": False}}}
+        observed = {"devices": {"modem-a": {
+            "present": True,
+            "actual": {"cellular_radio_enabled": True, "vowifi_bridge_active": True},
+            "cellular": {"available": True, "sim_iccid": "ct-card",
+                         "registration": "home", "operator": "CHN-CT",
+                         "radio_enabled": True, "data_active": True}}}}
+        line = {"id": "6", "name": "460-11-2964", "iccid": "ct-card",
+                "mcc": "460", "mnc": "11", "enabled": False}
+        with patch.object(main, "_device_sources", return_value=(desired, observed, {})), \
+                patch.object(main, "_device_identities", return_value={}), \
+                patch.object(main.hub, "cards_list", return_value=[]), \
+                patch.object(main.cfg, "list_instances", return_value=[line]), \
+                patch.object(main.device_state, "native_reader_devices", return_value={}), \
+                patch.object(main.device_state, "hardware", return_value={}), \
+                patch.object(main.cfg, "get_settings", return_value={
+                    "proxy": {"exits": {}}, "rekey": {"minutes": 30}}), \
+                patch.object(main, "_cached_line_status", return_value={"state": "STOPPED"}), \
+                patch.object(main.egress, "status", return_value={"exits": {}}), \
+                patch.object(main.egress, "line_country", return_value="cn"), \
+                patch.object(main.egress, "country_for_mcc", return_value="CN"):
+            devices = await main._unified_devices()
+
+        caps = devices[0]["capabilities"]
+        self.assertEqual(caps["cellular"]["actual"], "on")
+        self.assertFalse(caps["vowifi"]["desired"])
+        self.assertEqual(caps["vowifi"]["actual"], "off")
+        self.assertEqual(caps["vowifi"]["support"]["status"], "unsupported")
+        self.assertIn("Mainland China", caps["vowifi"]["reason"])
 
     async def test_saved_unplugged_modem_never_looks_like_it_is_transitioning(self):
         desired = {"devices": {"modem-a": {

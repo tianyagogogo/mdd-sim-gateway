@@ -9,14 +9,15 @@
   <a href="#快速安装">快速安装</a> ·
   <a href="docs/ARCHITECTURE.md">架构</a> ·
   <a href="docs/INSTALL.md">安装文档</a> ·
+  <a href="docs/CONTAINER_DEPLOYMENT.md">容器部署</a> ·
   <a href="https://github.com/MddIdd/mdd-sim-gateway/discussions">社区讨论</a>
 </p>
 
-MDD Sim Gateway 是面向 Debian / Ubuntu / Armbian ARM64 设备的自托管多 SIM 通信网关。它将蜂窝模块、USB 读卡器、IMS、EAP-AKA、eSIM、ModemManager 和 sing-box 整合进一个中英文 Web 控制台。
+MDD Sim Gateway 是自托管的多 SIM 通信网关，可以直接安装在 Debian / Ubuntu / Armbian ARM64 主机上，也可以在任何能运行 Docker Compose 的 Linux 主机上以全容器方式运行，包括群晖等 NAS。它将蜂窝模块、USB 读卡器、IMS、EAP-AKA、eSIM、ModemManager 和 sing-box 整合进一个中英文 Web 控制台。
 
 | 真实 SIM 鉴权 | 通话与短信 | 多模块管理 | 独立国家出口 |
 |---|---|---|---|
-| 在物理 SIM/eSIM 内完成 EAP-AKA 与 IMS-AKA，不读取 Ki/OP/OPc | 浏览器软电话、短信收发、通话记录与来电通知 | 统一管理蜂窝模块、PC/SC 读卡器和 eUICC | 为不同 SIM 的 ePDG 路由分配独立国家 TUN，UDP 失败时不泄漏 |
+| 在物理 SIM/eSIM 内完成 EAP-AKA 与 IMS-AKA，不读取 Ki/OP/OPc | 浏览器软电话、短信收发、通话记录与来电通知 | 统一管理蜂窝模块、PC/SC 读卡器和 eUICC | 每张 SIM 的 ePDG 流量走所选国家出口（宿主安装用独立 TUN，全容器用 SOCKS5），出口不通时不泄漏 |
 
 ## 界面导览
 
@@ -25,6 +26,19 @@ MDD Sim Gateway 是面向 Debian / Ubuntu / Armbian ARM64 设备的自托管多 
 <p align="center">概览 → 设备管理 → 浏览器通话 → 短信 → 余额与保号 → 系统更新　·　界面中的身份与内容均为虚构演示数据</p>
 
 ## 快速安装
+
+有两种部署方式，功能相同，按宿主机选择：
+
+| | 宿主安装 | 全容器部署 |
+|---|---|---|
+| 适用 | 树莓派等 Debian / Ubuntu / Armbian ARM64 主机 | 任何能运行 Docker Compose 的 amd64/arm64 Linux，包括群晖等 NAS |
+| 宿主上安装什么 | systemd 服务；安装器配置 pcscd、ModemManager、NetworkManager | 除 Docker 外不安装任何项目软件，全部服务都在容器内 |
+| 常驻容器 | 每条线路一个 Engine | Control、Hardware、Egress 三个基础容器，加每条线路一个 Engine |
+| 国家出口 | 每国独立 TUN 与 ePDG 路由 | 每国 SOCKS5 入口，不修改宿主路由表和 DNS |
+| 管理地址 | `https://<网关地址>:8443` | `https://<主机地址>:10443` |
+| 状态 | 正式版 | 正式版，已在群晖 DS1621+ 和树莓派实机验证 |
+
+### 方式一：宿主安装
 
 推荐使用具备 systemd、Docker、USB 和稳定网络的 Debian、Ubuntu 或 Armbian ARM64 主机。
 
@@ -43,6 +57,30 @@ sudo ./install.sh install
 ```
 
 安装完成后访问 `https://<网关地址>:8443`，并在受信的局域网或 VPN 中立即创建管理员账号。完整的前置检查、安装过程和升级方式见 [安装与升级](docs/INSTALL.md)。
+
+### 方式二：全容器部署（Docker Compose）
+
+除 Docker 外不在宿主上安装任何项目软件，也不需要运行安装脚本。宿主需要是 Linux：Docker Desktop
+（macOS/Windows）无法把 USB 设备交给容器，不能使用；rootless Docker 也不支持。
+
+1. **确认宿主已识别蜂窝模块。**插入模块后宿主应出现 `/dev/ttyUSB*`、`/dev/cdc-wdm*` 和
+   `wwan*` 网卡；普通 PC/SC 读卡器只需出现在 `/dev/bus/usb`。节点缺失说明宿主缺少内核驱动，
+   主流发行版内核一般自带所需驱动；群晖等精简内核可能缺失，DS1621+ 可使用随 Release 发布的驱动包，
+   见 [兼容性与驱动目录](drivers/README.md)。
+   宿主若已运行 ModemManager（Ubuntu 等发行版默认启用），先停用，否则它会和容器抢占模块。
+2. **下载 Compose 文件。**从 [Releases](https://github.com/MddIdd/mdd-sim-gateway/releases) 下载
+   `mdd-sim-gateway-compose-vX.Y.Z.yaml`，四个镜像已固定为该版本。
+3. **修改文件开头标出的两项。**`MDD_ADVERTISE_ADDR` 改成主机的局域网地址（浏览器通话的媒体
+   地址）；数据目录改成你的实际路径，文件中的 `/volume1/docker/mdd-sim-gateway` 是群晖的示例。
+   管理端口默认 `10443`。
+4. **启动。**普通 Linux 把文件保存为数据目录下的 `docker-compose.yml`，在该目录执行
+   `docker compose up -d`；群晖在 Container Manager 中新建项目并粘贴 YAML。
+5. **打开 `https://<主机地址>:10443`**，立即创建管理员账号。
+
+启动或重建 Hardware 时，它可能要先重置一次蜂窝模块，约一到两分钟后才变为健康，属于正常现象。四个镜像
+解压后每代约 1.3 GB，一键更新时新旧两代并存，请为 Docker 存储保留至少 6 GiB。更新、回滚和
+问题排查见 [全容器部署指南](docs/CONTAINER_DEPLOYMENT.md)。目前实机验证过的是群晖 DS1621+，
+其他主机的验证记录会补充到 [兼容性目录](drivers/README.md)。
 
 > 本项目直接控制蜂窝模块、SIM、网络路由和 IMS。运营商是否开放 Wi‑Fi Calling 仍取决于套餐、区域、设备身份和网络策略。
 
@@ -96,6 +134,7 @@ sudo ./install.sh install
 |---|---:|---:|---|
 | 支持 ModemManager 的蜂窝模块 | ✓ | ✓ | 模块 AT/逻辑通道桥接 |
 | 大疆/Quectel EC25 类模块 | ✓ | ✓ | 自动识别并创建所需虚拟读卡通道 |
+| Quectel EC20（`05c6:9215`） | 未验证 | ✓（用户实测） | 自动识别并创建所需虚拟读卡通道 |
 | USB PC/SC 读卡器 | — | ✓ | 直接 PC/SC |
 | 三体电子 SCR Prime（`04d9:c001`） | — | ✓ | 直接 PC/SC；安装时使用 `patchprime` 驱动补丁 |
 | eUICC/eSIM 读卡器 | — | ✓ | PC/SC + lpac |
@@ -105,7 +144,7 @@ sudo ./install.sh install
 
 ## 安装器会做什么
 
-安装脚本会自动：
+以下只适用于宿主安装；全容器部署不运行安装脚本。安装脚本会自动：
 
 1. 检查并复用现有系统 Docker（没有时才从发行版安装），安装 pcscd、ModemManager/NetworkManager；
 2. 按架构下载 sing-box 1.13.15 与 Xray-core 26.3.27 并验证 SHA-256；
@@ -129,7 +168,7 @@ sudo ./install.sh uninstall
 
 ## 使用边界
 
-> **合规警告：** 本软件仅供号码实名持有人在运营商明确允许的范围内自用。严禁用于诈骗、群呼、营销骚扰、验证码接收、号码或线路出租、代拨转接、隐藏实际控制地点，或向第三人提供电信服务。使用者必须遵守所在地法律、电话实名制和运营商协议；本项目不构成任何电信业务许可或运营商授权。MDD Sim Gateway 最多保存和运行 **5 条 SIM 线路**，不提供独立 SIP 账号或 Telegram 远程拨号、发短信及挂断功能。技术限制不代表某种使用方式当然合法。
+> **合规警告：** 本软件仅供号码实名持有人在运营商明确允许的范围内自用。严禁用于诈骗、群呼、营销骚扰、验证码接收、号码或线路出租、代拨转接、隐藏实际控制地点，或向第三人提供电信服务。使用者必须遵守所在地法律、电话实名制和运营商协议；本项目不构成任何电信业务许可或运营商授权。MDD Sim Gateway 最多保存和运行 **10 条 SIM 线路**，不提供独立 SIP 账号或 Telegram 远程拨号、发短信及挂断功能。技术限制不代表某种使用方式当然合法。
 
 ## 社区与反馈
 

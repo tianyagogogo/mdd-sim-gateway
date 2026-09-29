@@ -136,6 +136,12 @@ def setup(password: str, username: str = "admin") -> None:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
     os.chmod(temporary, 0o600)
     os.replace(temporary, AUTH_PATH)
+    # A new administrator starts with nobody signed in: sessions left from the one reset-admin
+    # removed must not carry over to the new account.
+    with _lock:
+        if _sessions:
+            _sessions.clear()
+            _save_sessions()
 
 
 def throttled(peer: str) -> int:
@@ -146,21 +152,33 @@ def throttled(peer: str) -> int:
     return max(0, 60 - int(now - attempts[-1])) if len(attempts) >= 5 else 0
 
 
-def login(username: str, password: str, peer: str,
-          remember: bool = False) -> tuple[str, str] | None:
+def verify(username: str, password: str, peer: str) -> bool:
+    """Check the administrator's credentials, counting a failure against the peer.
+
+    Both sign-ins use it: the browser's, which opens a session, and a client app's, which is
+    given a token instead (clients.py).
+    """
     data = _read()
     try:
         expected = bytes.fromhex(data["password_hash"])
         actual = _derive(password, bytes.fromhex(data["salt"]))
     except (KeyError, ValueError, TypeError):
-        return None
+        return False
     valid = hmac.compare_digest(str(username), str(data.get("username") or "admin"))
     valid = hmac.compare_digest(actual, expected) and valid
     with _lock:
-        if not valid:
+        if valid:
+            _failures.pop(peer, None)
+        else:
             _failures.setdefault(peer, []).append(time.time())
-            return None
-        _failures.pop(peer, None)
+    return valid
+
+
+def login(username: str, password: str, peer: str,
+          remember: bool = False) -> tuple[str, str] | None:
+    if not verify(username, password, peer):
+        return None
+    with _lock:
         token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
         ttl = float(SESSION_TTL_REMEMBER if remember else SESSION_TTL)
         _sessions[_token_key(token)] = {"csrf": csrf, "expires": time.time() + ttl,
@@ -188,6 +206,11 @@ def session(token: str | None) -> dict | None:
         else:
             item["expires"] = renewed
         return dict(item)
+
+
+def session_key(token: str | None) -> str:
+    """A stable name for one browser session that is not the session's secret."""
+    return _token_key(token) if token else ""
 
 
 def logout(token: str | None) -> None:

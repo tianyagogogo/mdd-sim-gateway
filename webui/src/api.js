@@ -79,6 +79,18 @@ export const api = {
   authLogin: (username, password, remember) => j('POST', '/api/auth/login', { username, password, remember }),
   authLogout: () => j('POST', '/api/auth/logout', {}),
   authPassword: (current_password, new_password) => j('POST', '/api/auth/password', { current_password, new_password }),
+  unreadMessages: (id) => j('GET', `/api/instances/${encodeURIComponent(id)}/messages/unread`),
+  markThreadRead: (id, body) => j('POST', `/api/instances/${encodeURIComponent(id)}/messages/read`, body),
+  unreadTotal: () => j('GET', '/api/messages/unread'),
+  contacts: (query = '') => j('GET', `/api/contacts${query ? `?query=${encodeURIComponent(query)}` : ''}`),
+  createContact: (body) => j('POST', '/api/contacts', body),
+  updateContact: (id, body) => j('PUT', `/api/contacts/${encodeURIComponent(id)}`, body),
+  deleteContact: (id) => j('DELETE', `/api/contacts/${encodeURIComponent(id)}`),
+  resolveContacts: (numbers, line) => j('POST', '/api/contacts/resolve', { numbers, line }),
+  importContacts: (file) => { const fd = new FormData(); fd.append('file', file, file.name); return form('POST', '/api/contacts/import', fd) },
+  contactsExportUrl: (format) => `/api/contacts/export?format=${encodeURIComponent(format)}`,
+  authClients: () => j('GET', '/api/auth/clients'),
+  revokeAuthClient: (id) => j('DELETE', `/api/auth/clients/${encodeURIComponent(id)}`),
   // Unified physical-device control plane. Older deployments may return 404;
   // App.jsx then derives read-only device cards from /api/instances + /api/cards.
   devices: () => j('GET', '/api/devices'),
@@ -86,7 +98,15 @@ export const api = {
   deviceCellular: (id) => j('GET', `/api/devices/${encodeURIComponent(id)}/cellular`),
   deviceDiagnostics: (id) => j('POST', `/api/devices/${encodeURIComponent(id)}/diagnostics`, {}),
   saveDeviceHardware: (id, patch) => j('PUT', `/api/devices/${encodeURIComponent(id)}/hardware`, patch),
+  rereadDeviceSim: (id) => j('POST', `/api/devices/${encodeURIComponent(id)}/sim/reread`),
+  getDeviceIms: (id) => j('GET', `/api/devices/${encodeURIComponent(id)}/ims`),
+  getDeviceVoiceAudio: (id) => j('GET', `/api/devices/${encodeURIComponent(id)}/voice-audio`),
+  setDeviceIms: (id, enabled) => j('PUT', `/api/devices/${encodeURIComponent(id)}/ims`, { enabled }),
   deleteDevice: (id) => j('DELETE', `/api/devices/${encodeURIComponent(id)}`),
+  // Modem-like USB devices no configured model matches, tested only when asked.
+  usbCandidates: () => j('GET', '/api/hardware/usb-candidates'),
+  probeUsbCandidate: (usbPath) => j('POST', `/api/hardware/usb-candidates/${encodeURIComponent(usbPath)}/probe`, {}),
+  deleteModemProfile: (vid, pid) => j('DELETE', `/api/hardware/modem-profiles/${encodeURIComponent(vid)}/${encodeURIComponent(pid)}`),
   readers: () => j('GET', '/api/readers'),
   detect: (i = 0) => j('GET', `/api/sim/detect?reader_index=${i}`),
   // `reader` (PC/SC reader NAME) lets the backend re-resolve the index at request time —
@@ -165,19 +185,39 @@ export const api = {
   // delete messages: { ids:[...] } | { peer } (whole conversation) | { all:true }
   deleteMessages: (id, sel) => j('POST', `/api/instances/${id}/messages/delete`, sel),
 
-  // MMS. Sending is multipart/form-data (attachments), so it goes through form() rather
-  // than j(); everything else is plain JSON like the rest of the API.
+  // MMS. Uploads and sending are multipart/form-data, so they go through form() rather than
+  // j(); everything else is plain JSON like the rest of the API.
   mmsDownload: (id, mid) => j('POST', `/api/instances/${id}/messages/${mid}/mms/download`, {}),
   // Same-origin, cookie-authenticated URL for a part's content — used directly as an <img
   // src>, <audio>/<video> src, or download <a href>. download=1 forces attachment disposition.
   mmsPartUrl: (id, mid, pid, download = false) =>
     `/api/instances/${id}/messages/${mid}/mms/parts/${pid}${download ? '?download=1' : ''}`,
-  sendMms: (id, { to, text, subject, files }) => {
+  // Upload one attachment while composing. The gateway checks it at once (422 with a human
+  // -readable `detail` for a format it will refuse, 409 when too many uploads are already
+  // waiting, 413 when it is too large) and keeps it staged until sent or removed.
+  stageMmsAttachment: (id, file) => {
+    const fd = new FormData()
+    fd.append('file', file, file.name)
+    return form('POST', `/api/instances/${id}/mms/attachments`, fd)
+  },
+  // What the message would actually carry once the gateway converts and shrinks these staged
+  // attachments together: { ids, text, subject, to }. A 404 means one of the ids is gone (e.g.
+  // swept) -- the caller should drop it and retry with what remains.
+  fitMmsAttachments: (id, body) => j('POST', `/api/instances/${id}/mms/attachments/fit`, body),
+  // The fitted picture for a staged attachment's thumbnail (415 for a non-image). `version` is
+  // the "preview" token the fit returned: the same attachment fits differently when it shares
+  // a message and when it is sent alone, and the token names the version that fit produced.
+  mmsAttachmentPreviewUrl: (id, aid, version) =>
+    `/api/instances/${id}/mms/attachments/${encodeURIComponent(aid)}/preview?v=${encodeURIComponent(version ?? '')}`,
+  removeMmsAttachment: (id, aid) => j('DELETE', `/api/instances/${id}/mms/attachments/${encodeURIComponent(aid)}`),
+  // `split` sends each attachment as its own MMS (the text and subject with the first).
+  sendMms: (id, { to, text, subject, attachment_ids, split }) => {
     const fd = new FormData()
     fd.append('to', to || '')
     fd.append('text', text || '')
     if (subject) fd.append('subject', subject)
-    for (const file of (files || [])) fd.append('attachments', file, file.name)
+    if (split) fd.append('split', '1')
+    for (const aid of (attachment_ids || [])) fd.append('attachment_ids', aid)
     return form('POST', `/api/instances/${id}/mms/send`, fd)
   },
   mmsSettings: (id) => j('GET', `/api/instances/${id}/mms/settings`),
@@ -198,6 +238,8 @@ export const api = {
   cellularCallStatus: (id) => j('GET', `/api/instances/${id}/cellular-call/status`),
   cellularCallHangup: (id) => j('POST', `/api/instances/${id}/cellular-call/hangup`, {}),
   softphone: (id) => j('GET', `/api/instances/${id}/softphone`),
+  // Call media mode and the relay's state; read-only, switched by the installer.
+  media: () => j('GET', '/api/media'),
 
   // eSIM / LPA (lpac) — first arg is usually the PC/SC reader NAME (string).
   // Optional se_id / aid target a specific Secure Element on dual-SE cards.
@@ -272,7 +314,7 @@ export const api = {
   },
 }
 
-export function connectWs(onMsg, onAuthLost) {
+export function connectWs(onMsg, onAuthLost, onOriginRefused) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
   let ws, alive = true
   const open = () => {
@@ -284,6 +326,13 @@ export function connectWs(onMsg, onAuthLost) {
       if (event.code === 4401) {
         alive = false
         onAuthLost?.()
+        return
+      }
+      // 4403: the gateway does not recognise this page's origin -- a reverse proxy rewrote the
+      // Host header without being listed as trusted. Retrying cannot fix that; say so instead.
+      if (event.code === 4403) {
+        alive = false
+        onOriginRefused?.()
         return
       }
       if (alive) setTimeout(open, 2000)

@@ -84,6 +84,12 @@ class Status:
         self.extra: dict = {}
 
     def publish(self, state: str, phase: str, **fields):
+        if phase != self.phase:
+            for key in ("url", "artifact", "downloaded_bytes", "total_bytes", "speed_bps",
+                        "elapsed_seconds", "detail", "route_attempt", "route_total",
+                        "engine_index", "engine_total", "error", "rollback_succeeded",
+                        "rollback_error"):
+                self.extra.pop(key, None)
         self.phase = phase
         self.extra.update(fields)
         atomic_json(self.path, {"state": state, "phase": phase, "target": self.target,
@@ -276,8 +282,10 @@ def verify_release_file(artifact: Path, sums: Path, description: str):
     with open(artifact, "rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
-    if digest.hexdigest() != expected:
+    actual = digest.hexdigest()
+    if actual != expected:
         raise UpdateError(f"release {description} checksum mismatch")
+    return actual
 
 
 def installed_mode(data: Path) -> str:
@@ -285,7 +293,7 @@ def installed_mode(data: Path) -> str:
         mode = (data / "install-mode").read_text(encoding="utf-8").strip().lower()
     except OSError:
         mode = ""
-    return mode if mode in {"local", "docker"} else "local"
+    return mode if mode in {"local", "docker", "container"} else "local"
 
 
 def load_control_image(artifact: Path, version: str):
@@ -316,6 +324,43 @@ def load_control_image(artifact: Path, version: str):
             subprocess.run(["docker", "tag", previous, image], stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL)
         raise UpdateError(f"Release control image identity mismatch: {actual or 'unreadable'}")
+
+
+def load_runtime_image(artifact: Path, version: str, component: str):
+    """Load one verified full-container image and retain the previous local tag."""
+    if component not in {"hardware", "egress"}:
+        raise UpdateError(f"invalid runtime image component: {component!r}")
+    image = f"mdd-sim-gateway/{component}"
+    previous = f"{image}:previous"
+    inspected = subprocess.run(
+        ["docker", "image", "inspect", image, "--format", "{{.Id}}"],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    had_previous = inspected.returncode == 0 and bool(inspected.stdout.strip())
+    if had_previous:
+        tagged = subprocess.run(["docker", "tag", image, previous],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if tagged.returncode:
+            raise UpdateError(
+                f"could not preserve the current {component} image: {tagged.stderr.strip()}")
+    loaded = subprocess.run(["docker", "load", "--input", str(artifact)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if loaded.returncode:
+        raise UpdateError(
+            f"could not load Release {component} image: {loaded.stderr.strip()}")
+    checked = subprocess.run(
+        ["docker", "image", "inspect", image, "--format",
+         '{{.Architecture}}|{{index .Config.Labels "io.mdd-sim-gateway.component"}}|'
+         '{{index .Config.Labels "io.mdd-sim-gateway.managed"}}|'
+         '{{index .Config.Labels "org.opencontainers.image.version"}}'],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    actual = checked.stdout.strip() if checked.returncode == 0 else ""
+    expected = f"{host_arch()}|{component}|true|{version}"
+    if actual != expected:
+        if had_previous:
+            subprocess.run(["docker", "tag", previous, image], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        raise UpdateError(
+            f"Release {component} image identity mismatch: {actual or 'unreadable'}")
 
 
 def release_engine_fingerprints(source_root: Path) -> tuple[str, str] | None:
@@ -513,7 +558,7 @@ def perform_release_image_install(repo: Path, data: Path, version: str, repo_nam
         raise UpdateError(f"invalid target version: {version!r}")
     if not REPOSITORY_RE.fullmatch(repo_name):
         raise UpdateError(f"invalid repository: {repo_name!r}")
-    if mode not in {"local", "docker"}:
+    if mode not in {"local", "docker", "container"}:
         raise UpdateError(f"invalid install mode: {mode!r}")
     manifest = repo / ENGINE_HANDOFF_MANIFEST
     if not manifest.is_file():
@@ -521,8 +566,13 @@ def perform_release_image_install(repo: Path, data: Path, version: str, repo_nam
 
     arch = host_arch()
     engine_name = f"mdd-sim-gateway-engine-v{version}-{arch}.tar.gz"
-    control_name = f"mdd-sim-gateway-control-v{version}-{arch}.tar.gz"
-    required = [engine_name] + ([control_name] if mode == "docker" else [])
+    base_names = {
+        component: f"mdd-sim-gateway-{component}-v{version}-{arch}.tar.gz"
+        for component in ("control", "hardware", "egress")
+    }
+    components = (["control"] if mode == "docker" else
+                  ["control", "hardware", "egress"] if mode == "container" else [])
+    required = [engine_name] + [base_names[component] for component in components]
     named = {
         parts[1].lstrip("*")
         for line in manifest.read_text(encoding="utf-8").splitlines()
@@ -534,7 +584,8 @@ def perform_release_image_install(repo: Path, data: Path, version: str, repo_nam
 
     update_dir = data / "update"
     update_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    minimum_free = (3 if mode == "docker" else 2) * 1024 * 1024 * 1024
+    minimum_free = ({"local": 2, "docker": 3, "container": 6}[mode]
+                    * 1024 * 1024 * 1024)
     if shutil.disk_usage(update_dir).free < minimum_free:
         raise UpdateError("not enough persistent disk space to import the Release images")
     network = read_network_config(network_path) if network_path else {}
@@ -562,14 +613,70 @@ def perform_release_image_install(repo: Path, data: Path, version: str, repo_nam
             engine_archive, version, *fingerprints, None, update_dir / "engine-image.log")
         engine_archive.unlink(missing_ok=True)
 
-        if mode == "docker":
-            control_archive = staging / control_name
-            fetch_release_asset(
-                f"{base}/{control_name}", control_archive, control_name, clean_routes,
-                active_route, asset_sizes=asset_sizes, phase="control_image")
-            verify_release_file(control_archive, manifest, f"{arch} control image")
-            load_control_image(control_archive, version)
+        for component in components:
+            name = base_names[component]
+            component_archive = staging / name
+            active_route = fetch_release_asset(
+                f"{base}/{name}", component_archive, name, clean_routes,
+                active_route, asset_sizes=asset_sizes, phase=f"{component}_image")
+            verify_release_file(component_archive, manifest, f"{arch} {component} image")
+            if component == "control":
+                load_control_image(component_archive, version)
+            else:
+                load_runtime_image(component_archive, version, component)
         return distributed
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def load_relay_image(artifact: Path, version: str) -> str:
+    """Load the media relay asset: upstream coturn, unmodified, so it carries no MDD labels.
+    The checksum (covered by the release archive's) proves what it is; check the tag and the
+    architecture it was loaded under."""
+    image = f"mdd-sim-gateway/relay:v{version}"
+    loaded = subprocess.run(["docker", "load", "--input", str(artifact)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if loaded.returncode:
+        raise UpdateError(f"could not load Release relay image: {loaded.stderr.strip()}")
+    checked = subprocess.run(["docker", "image", "inspect", image, "--format",
+                              "{{.Architecture}}"],
+                             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    actual = checked.stdout.strip() if checked.returncode == 0 else ""
+    if actual != host_arch():
+        raise UpdateError(f"Release relay image identity mismatch: {actual or 'unreadable'}")
+    return image
+
+
+def perform_relay_image_install(repo: Path, data: Path, version: str, repo_name: str,
+                                network_path: Path | None = None) -> str:
+    """Download and import the media relay image named by an official release source archive
+    (relay media mode only; control/app/media.py falls back to registries without one)."""
+    if not VERSION_RE.fullmatch(version):
+        raise UpdateError(f"invalid target version: {version!r}")
+    if not REPOSITORY_RE.fullmatch(repo_name):
+        raise UpdateError(f"invalid repository: {repo_name!r}")
+    manifest = repo / ENGINE_HANDOFF_MANIFEST
+    if not manifest.is_file():
+        raise UpdateError("release has no image asset manifest")
+    name = f"mdd-sim-gateway-relay-v{version}-{host_arch()}.tar.gz"
+    network = read_network_config(network_path) if network_path else {}
+    fallback_proxy = str(network.get("proxy_url") or os.environ.get("HTTPS_PROXY")
+                         or os.environ.get("https_proxy") or "")
+    clean_routes = validated_download_routes(
+        fallback_proxy,
+        route=str(network.get("route") or ("library" if fallback_proxy else "direct")),
+        route_name=str(network.get("route_name") or ""),
+        routes=network.get("routes") if isinstance(network.get("routes"), list) else None)
+    update_dir = data / "update"
+    update_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix="relay-image.", dir=str(update_dir)))
+    try:
+        archive = staging / name
+        fetch_release_asset(
+            f"https://github.com/{repo_name}/releases/download/v{version}/{name}",
+            archive, name, clean_routes, phase="relay_image")
+        verify_release_file(archive, manifest, f"{host_arch()} relay image")
+        return load_relay_image(archive, version)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
@@ -721,7 +828,9 @@ def main():
     parser.add_argument("--network-config", type=Path)
     parser.add_argument("--engine-handoff", action="store_true")
     parser.add_argument("--install-images", action="store_true")
-    parser.add_argument("--install-mode", choices=("local", "docker"), default="local")
+    parser.add_argument("--install-relay-image", action="store_true")
+    parser.add_argument("--install-mode", choices=("local", "docker", "container"),
+                        default="local")
     args = parser.parse_args()
     data = args.data.resolve()
     network_path = args.network_config.resolve() if args.network_config else None
@@ -730,6 +839,15 @@ def main():
     if args.engine_handoff:
         try:
             image = perform_engine_handoff(
+                args.repo.resolve(), data, args.version, args.repository, network_path)
+        except Exception as exc:
+            print(str(exc), file=sys.stderr)
+            raise SystemExit(1)
+        print(image)
+        return
+    if args.install_relay_image:
+        try:
+            image = perform_relay_image_install(
                 args.repo.resolve(), data, args.version, args.repository, network_path)
         except Exception as exc:
             print(str(exc), file=sys.stderr)

@@ -1,6 +1,6 @@
 fastapi==0.141.1
 uvicorn[standard]==0.52.0
-websockets>=15.0
+websockets==17.1
 pyscard==2.3.1
 panoramisk==1.4
 docker==7.2.0
@@ -11,3 +11,6 @@ python-multipart==0.0.32
 requests==2.34.2
 PySocks==1.7.1
 pyserial==3.5
+phonenumberslite==9.0.39
+Pillow==12.3.0
+pi-heif==1.4.0

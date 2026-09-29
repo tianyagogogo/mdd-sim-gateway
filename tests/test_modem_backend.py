@@ -5,9 +5,10 @@ from unittest.mock import patch
 
 from host import mdd_orchestrator
 from host.mdd_orchestrator import Orchestrator
-from host.vpcd_modem_bridge import (ModemCard, ModemError, ModemManagerCard,
-                                    allocate_logical_channels,
-                                    logical_channel_metadata, serve_slot)
+from host.vpcd_modem_bridge import (ChannelArbiter, ModemCard, ModemError,
+                                    ModemManagerCard, allocate_logical_channels,
+                                    logical_channel_metadata, serve_slot,
+                                    slot_channel_map)
 
 
 class ManageChannelTests(unittest.TestCase):
@@ -93,14 +94,40 @@ class ModemBackendTests(unittest.TestCase):
             {"slot": 2, "channel": 3, "role": "ims"},
         ])
 
-    def test_partial_logical_channel_allocation_is_released_with_clear_error(self):
-        card = self.FakeCard((1, 1, 1))
-        with self.assertRaisesRegex(ModemError,
-                                    "SIM logical channel allocation failed \\(1/3 allocated\\)"):
-            allocate_logical_channels(card, 3)
-        self.assertEqual(card.closed, [1])
-        # Only a channel that stays duplicated across settle+retry is a real allocation failure.
+    def test_a_card_that_runs_out_of_channels_is_served_with_what_it_granted(self):
+        """A China Unicom USIM grants channel 1 and answers the second OPEN with 6A81.
+        Refusing the whole card left a registered modem showing "no SIM" and no VoWiFi."""
+        card = self.FakeCard((1, ModemError("MANAGE CHANNEL OPEN failed: 006a81")))
+        self.assertEqual(allocate_logical_channels(card, 3), [1])
+        self.assertEqual(card.closed, [])
+
+    def test_a_channel_that_stays_duplicated_ends_allocation_without_failing(self):
+        card = self.FakeCard((1, 1, 1, 1))
+        self.assertEqual(allocate_logical_channels(card, 3), [1])
+        # Only a channel that stays duplicated across settle+retry stops allocation.
         self.assertEqual(card.settled, 2)
+        self.assertEqual(card.closed, [])
+
+    def test_a_card_that_grants_no_channel_is_still_refused(self):
+        card = self.FakeCard((ModemError("MANAGE CHANNEL OPEN failed: 006a81"),))
+        with self.assertRaisesRegex(ModemError,
+                                    "SIM logical channel allocation failed \\(0/3 allocated\\)"):
+            allocate_logical_channels(card, 3)
+        self.assertEqual(card.closed, [])
+
+    def test_slots_share_channels_when_the_card_grants_fewer(self):
+        self.assertEqual(slot_channel_map([1, 2, 3], 3), [1, 2, 3])
+        self.assertEqual(slot_channel_map([1], 3), [1, 1, 1])
+        # IMS keeps its own channel: Asterisk gives up on a slow AKA answer.
+        self.assertEqual(slot_channel_map([1, 2], 3), [1, 1, 2])
+
+    def test_shared_channel_metadata_reports_every_served_slot(self):
+        value = logical_channel_metadata([1], 3, slot_channels=[1, 1, 1])
+        self.assertEqual(value["channel_allocated"], 1)
+        self.assertEqual(value["slots_served"], 3)
+        self.assertTrue(value["channel_shared"])
+        self.assertEqual([item["channel"] for item in value["logical_channels"]], [1, 1, 1])
+        self.assertFalse(logical_channel_metadata([1, 2, 3])["channel_shared"])
 
     def test_a_repeated_channel_number_is_retried_before_the_bridge_gives_up(self):
         """A late AT reply read as the answer to the next command repeats the previous
@@ -118,7 +145,10 @@ class ModemBackendTests(unittest.TestCase):
             self.settled = 0
 
         def open_channel(self):
-            return next(self.values)
+            value = next(self.values)
+            if isinstance(value, Exception):
+                raise value
+            return value
 
         def close_channel(self, channel):
             self.closed.append(channel)
@@ -165,7 +195,7 @@ class ModemBackendTests(unittest.TestCase):
                 patch("host.vpcd_modem_bridge.time.sleep", side_effect=sleeps.append), \
                 patch("builtins.print", side_effect=lambda *a, **k: lines.append(a[0])):
             with self.assertRaises(KeyboardInterrupt):
-                serve_slot(None, "127.0.0.1", 36221, 2, 3, b"", False)
+                serve_slot(SimpleNamespace(channel=3), "127.0.0.1", 36221, 2, b"", False)
 
         self.assertEqual(len(lines), 1, "an unchanged reason must be reported once")
         self.assertIn("Connection refused", lines[0])
@@ -185,11 +215,116 @@ class ModemBackendTests(unittest.TestCase):
                 patch("host.vpcd_modem_bridge.time.sleep"), \
                 patch("builtins.print", side_effect=lambda *a, **k: lines.append(a[0])):
             with self.assertRaises(KeyboardInterrupt):
-                serve_slot(None, "127.0.0.1", 36221, 2, 3, b"", False)
+                serve_slot(SimpleNamespace(channel=3), "127.0.0.1", 36221, 2, b"", False)
 
         self.assertEqual(len(lines), 2)
         self.assertIn("timed out", lines[1])
 
+
+
+class SharedChannelTests(unittest.TestCase):
+    """Slots sharing one UICC channel must each find the card where they left it."""
+
+    USIM = bytes.fromhex("00A4040410A0000000871002FFFFFFFF8900000100")
+    EF_IMSI = bytes.fromhex("00A40004026F07")
+    ISIM = bytes.fromhex("00A4040410A0000000871004FFFFFFFF8900000100")
+    READ = bytes.fromhex("00B0000009")
+    AUTH = bytes.fromhex("00880081" + "22" + "10" + "00" * 16 + "10" + "00" * 16)
+    GET_RESPONSE = bytes.fromhex("00C0000035")
+
+    class Card:
+        def __init__(self, replies=None):
+            self.sent = []
+            self.replies = dict(replies or {})
+
+        def transmit(self, apdu, channel):
+            self.sent.append((bytes(apdu), channel))
+            return self.replies.get(bytes(apdu), bytes.fromhex("9000"))
+
+        @staticmethod
+        def closes_logical_channel(apdu, channel):
+            return ModemCard.closes_logical_channel(apdu, channel)
+
+        def select_mf(self, channel):
+            self.sent.append((bytes.fromhex("00A40004023F00"), channel))
+
+    def test_a_slot_alone_on_its_channel_never_replays(self):
+        card = self.Card()
+        arbiter = ChannelArbiter(card, 2)
+        for apdu in (self.USIM, self.EF_IMSI, self.READ, self.AUTH):
+            arbiter.transmit(1, apdu)
+        self.assertEqual([apdu for apdu, _ in card.sent],
+                         [self.USIM, self.EF_IMSI, self.READ, self.AUTH])
+
+    def test_the_next_owner_gets_its_selection_back_first(self):
+        card = self.Card()
+        arbiter = ChannelArbiter(card, 1)
+        arbiter.transmit(0, self.USIM)
+        arbiter.transmit(0, self.EF_IMSI)
+        arbiter.transmit(2, self.ISIM)          # IMS moves the channel to ADF.ISIM
+        card.sent.clear()
+
+        arbiter.transmit(0, self.READ)          # PIN keeper resumes its EF_IMSI read
+        self.assertEqual([apdu for apdu, _ in card.sent],
+                         [self.USIM, self.EF_IMSI, self.READ])
+        self.assertTrue(all(channel == 1 for _, channel in card.sent))
+
+    def test_a_slot_that_selected_nothing_is_put_back_on_mf(self):
+        card = self.Card()
+        arbiter = ChannelArbiter(card, 1)
+        arbiter.transmit(2, self.ISIM)
+        card.sent.clear()
+        arbiter.transmit(1, self.READ)
+        self.assertEqual(card.sent[0], (bytes.fromhex("00A40004023F00"), 1))
+
+    def test_a_failed_select_does_not_change_what_is_replayed(self):
+        missing = bytes.fromhex("00A40004026F99")
+        card = self.Card({missing: bytes.fromhex("6A82")})
+        arbiter = ChannelArbiter(card, 1)
+        arbiter.transmit(0, self.USIM)
+        arbiter.transmit(0, missing)
+        arbiter.transmit(2, self.ISIM)
+        card.sent.clear()
+        arbiter.transmit(0, self.READ)
+        self.assertEqual([apdu for apdu, _ in card.sent], [self.USIM, self.READ])
+
+    def test_an_owed_get_response_keeps_the_channel(self):
+        """AUTHENTICATE answered 61xx must be followed by GET RESPONSE on the same channel;
+        another slot slipping in between would take the other slot's authentication result."""
+        card = self.Card({self.AUTH: bytes.fromhex("6135")})
+        arbiter = ChannelArbiter(card, 1)
+        arbiter.transmit(2, self.ISIM)
+        arbiter.transmit(2, self.AUTH)
+        order = []
+        other = threading.Thread(target=lambda: (arbiter.transmit(0, self.READ),
+                                                 order.append("pin")))
+        other.start()
+        other.join(0.2)
+        self.assertTrue(other.is_alive(), "the PIN slot must wait for the owed response")
+        arbiter.transmit(2, self.GET_RESPONSE)
+        order.append("ims")
+        other.join(2)
+        self.assertFalse(other.is_alive())
+        sent = [apdu for apdu, _ in card.sent]
+        self.assertLess(sent.index(self.GET_RESPONSE), sent.index(self.READ))
+
+    def test_an_abandoned_get_response_does_not_block_forever(self):
+        card = self.Card({self.AUTH: bytes.fromhex("6135")})
+        arbiter = ChannelArbiter(card, 1)
+        arbiter.transmit(2, self.AUTH)
+        with patch("host.vpcd_modem_bridge.PENDING_RESPONSE_HOLD_SECONDS", 0.05):
+            arbiter.pending_deadline = __import__("time").monotonic() + 0.05
+            self.assertEqual(arbiter.transmit(0, self.READ), bytes.fromhex("9000"))
+
+    def test_a_reset_puts_only_that_slot_back_on_mf(self):
+        card = self.Card()
+        arbiter = ChannelArbiter(card, 1)
+        arbiter.transmit(0, self.USIM)
+        arbiter.transmit(2, self.ISIM)
+        arbiter.reset(2)
+        card.sent.clear()
+        arbiter.transmit(0, self.READ)
+        self.assertEqual([apdu for apdu, _ in card.sent], [self.USIM, self.READ])
 
 class ControlLineToleranceTests(unittest.TestCase):
     """pyserial asserts DTR/RTS inside open() with no way to opt out (pyserial#729).

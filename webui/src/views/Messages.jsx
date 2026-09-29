@@ -1,9 +1,11 @@
-import React, { useEffect, useLayoutEffect, useState, useCallback, useRef } from 'react'
+import React, { useEffect, useLayoutEffect, useMemo, useState, useCallback, useRef } from 'react'
 import { api } from '../api.js'
 import SimSelector from './SimSelector.jsx'
 import MmsSettings from './MmsSettings.jsx'
-import { fitAttachments } from '../mmsImage.js'
+import { FALLBACK_FORMATS, acceptAttribute, isAttachable } from '../mmsFormats.js'
+import { formatBytes } from '../mmsAttachments.js'
 import { useI18n } from '../i18n.jsx'
+import { useContactNames } from '../contactNames.js'
 
 // application/smil is the MMS presentation part (layout/timing for the other parts); it is
 // never itself content, so it is never rendered as an attachment.
@@ -12,24 +14,45 @@ const MMS_SMIL_TYPE = 'application/smil'
 // applies (or the wait is worth explaining). 'retrieved' has full parts and needs neither.
 const MMS_PENDING_STATES = new Set(['notified', 'downloading', 'failed', 'expired'])
 
-export default function Messages({ selected, subscribe, showToast, instances, cards, devices, setSelected, initialLoading, loadErrors }) {
+export default function Messages({ selected, subscribe, showToast, instances, cards, devices, setSelected, initialLoading, loadErrors, refreshUnread }) {
   const { t: tr } = useI18n()
   const id = selected?.id
   const [threads, setThreads] = useState([])
+  // Unread counts per conversation, from the gateway: "read" is something the reader did, and
+  // the browser cannot work it out on its own -- it would have to have seen every message that
+  // ever arrived, on every device.
+  const [unread, setUnread] = useState({})
   const [threadsLoading, setThreadsLoading] = useState(false)
   const [peer, setPeer] = useState(null)
+  // One request for the whole conversation list, not one per row.
+  const contactNames = useContactNames(threads.map((thread) => thread.peer).concat(peer || []), id)
   const [msgs, setMsgs] = useState([])
   const [messagesLoading, setMessagesLoading] = useState(false)
   const [text, setText] = useState('')
   const [newTo, setNewTo] = useState('')
+  const [composing, setComposing] = useState(false) // a new message open, with no peer yet
   const [transport, setTransport] = useState('auto')
   const [sending, setSending] = useState(false)
   const [selMode, setSelMode] = useState(false)      // multi-select messages to delete
   const [selIds, setSelIds] = useState(() => new Set())
   const [binary, setBinary] = useState([])           // filed non-text payloads (see BinaryPayloads)
-  const [attachments, setAttachments] = useState([]) // [{file, url}] queued for the next MMS
+  // Attachments staged on the gateway for the next MMS: {key, name, localUrl, id, status
+  // ('uploading'|'ready'), original_size, size, content_type, original_type, converted,
+  // reduced, adjustable, width, height, fitted}. `reduced`: the gateway had too little memory
+  // to decode the picture whole and sends it smaller than it otherwise would. `id` is the gateway's staged-attachment id, set once
+  // the upload finishes; `fitted` becomes true after the first successful fit response, which
+  // is when the server preview (rather than the local object URL) becomes the thumbnail.
+  const [attachments, setAttachments] = useState([])
   const [subject, setSubject] = useState('')
   const [mmsCfg, setMmsCfg] = useState(null)         // this line's effective MMS settings
+  const [mmsFormats, setMmsFormats] = useState(FALLBACK_FORMATS) // this line's attachment table
+  // What the gateway reports the composed MMS would carry, from the last successful fit:
+  // {size, limit, fits, problem}. null until attachments exist and a first fit has returned.
+  const [fit, setFit] = useState(null)
+  // Send each attachment as its own MMS instead of all in one: a line's limit is per MMS, so
+  // pictures sharing one message each come out smaller. Chosen per send; one MMS by default.
+  const [splitMms, setSplitMms] = useState(false)
+  const [fitPending, setFitPending] = useState(false) // a fit request is in flight
   const [mmsBusy, setMmsBusy] = useState(() => new Set())  // message ids mid-download
   const [showMmsSettings, setShowMmsSettings] = useState(false)
   const activeId = useRef(id)
@@ -39,6 +62,15 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   const sendingRef = useRef(false)
   const fileInputRef = useRef(null)
   const attachmentsRef = useRef(attachments)
+  const attachSeq = useRef(0)
+  const fitRequest = useRef(0)
+  const fitTimer = useRef(null)
+  // Latest text/subject/recipient, read by the debounced fit call so it never needs its own
+  // dependency array (and so a fit already in flight always packages the newest draft).
+  const textRef = useRef(text)
+  const subjectRef = useRef(subject)
+  const recipientRef = useRef(peer || newTo)
+  const splitRef = useRef(splitMms)
   const listRef = useRef(null)
   const listContentRef = useRef(null)
   // Whether the message list should follow its bottom edge: true when a conversation is
@@ -48,9 +80,16 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   // The list's scrollTop at the last scroll event, to tell the reader scrolling up from
   // everything else that fires a scroll event.
   const lastScrollTop = useRef(0)
+  // Read inside the peer effect, which must not re-run when a count changes.
+  const unreadRef = useRef(unread)
+  unreadRef.current = unread
   activeId.current = id
   activePeer.current = peer
   attachmentsRef.current = attachments
+  textRef.current = text
+  subjectRef.current = subject
+  recipientRef.current = peer || newTo
+  splitRef.current = splitMms
 
   // Cellular SMS is available only when this line is currently attached to a live modem.
   // Older backends do not expose a dedicated SMS capability, so use the unified device type
@@ -62,14 +101,21 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   // Absent settings (not loaded yet, or an older backend without the endpoint) never block
   // attaching a file; only an explicit "off" or "unconfigured" answer does.
   const mmsDisabled = Boolean(mmsCfg && (!mmsCfg.enabled || !mmsCfg.configured))
+  // Sending while an attachment is still uploading (its id isn't known yet) or a fit is in
+  // flight (the packaged size shown could already be stale) would submit the wrong thing.
+  const attachmentsBusy = attachments.some((a) => a.status === 'uploading') || fitPending
 
   const loadThreads = useCallback(async (showLoading = false) => {
     if (!id) return
     const request = ++threadsRequest.current
     if (showLoading) setThreadsLoading(true)
     try {
-      const r = await api.threads(id)
-      if (request === threadsRequest.current && activeId.current === id) setThreads(r.threads)
+      const [r, counts] = await Promise.all([api.threads(id), api.unreadMessages(id).catch(() => null)])
+      if (request === threadsRequest.current && activeId.current === id) {
+        setThreads(r.threads)
+        // An older control plane has no unread endpoint; the list still works without it.
+        if (counts) setUnread(counts.unread || {})
+      }
     } catch {}
     finally {
       if (request === threadsRequest.current && activeId.current === id) setThreadsLoading(false)
@@ -87,32 +133,87 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
     } catch { if (activeId.current === id) setBinary([]) }
   }, [id])
 
-  // The line's MMS enablement/config, used to gate the attach button and to size-plan
-  // attachments client-side. Missing/erroring is treated as "unknown" (attach stays enabled)
-  // rather than as "disabled", so an older backend without this endpoint never blocks MMS.
+  // The line's MMS enablement/config and attachment table, used to gate the attach button and
+  // to decide what the picker/paste/drop will offer. Missing/erroring is treated as "unknown"
+  // (attach stays enabled) rather than as "disabled", so an older backend without this
+  // endpoint never blocks MMS; an older backend that answers with no `formats` field falls
+  // back to FALLBACK_FORMATS (its own, older, fixed rules).
   const loadMmsCfg = useCallback(async () => {
     if (!id) return
     try {
       const r = await api.mmsSettings(id)
-      if (activeId.current === id) setMmsCfg(r.effective)
-    } catch { if (activeId.current === id) setMmsCfg(null) }
+      if (activeId.current === id) {
+        setMmsCfg(r.effective)
+        setMmsFormats(r.formats && r.formats.length ? r.formats : FALLBACK_FORMATS)
+      }
+    } catch { if (activeId.current === id) { setMmsCfg(null); setMmsFormats(FALLBACK_FORMATS) } }
   }, [id])
 
   const clearAttachments = useCallback(() => {
-    setAttachments((prev) => { prev.forEach((a) => a.url && URL.revokeObjectURL(a.url)); return [] })
+    setAttachments((prev) => { prev.forEach((a) => a.localUrl && URL.revokeObjectURL(a.localUrl)); return [] })
+    setFit(null)
+    setSplitMms(false)
   }, [])
+
+  // A browser can display these types straight from an object URL without asking the
+  // gateway; everything else (HEIC before conversion, audio, video, vcard…) gets a generic
+  // icon until — for an image — the first fit's server preview is ready.
+  const canPreviewLocally = (type) =>
+    ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp', 'image/bmp']
+      .includes(String(type || '').toLowerCase())
+
+  // Upload one already-picked file: an 'uploading' chip appears immediately (added by the
+  // caller), this fills in the gateway id and flips it to 'ready' on success, or removes it
+  // and surfaces the gateway's reason (422/409/413 `detail`) on refusal. If the operator has
+  // since switched to another line, the upload is not adopted into the (now different)
+  // composer state — its staged file is deleted on the gateway instead.
+  const stageFile = async (forId, file, key) => {
+    try {
+      const r = await api.stageMmsAttachment(forId, file)
+      if (activeId.current !== forId) {
+        api.removeMmsAttachment(forId, r.attachment.id).catch(() => {})
+        return
+      }
+      setAttachments((prev) => prev.map((a) => (a.key === key ? {
+        ...a, id: r.attachment.id, status: 'ready',
+        content_type: r.attachment.content_type, size: r.attachment.size,
+        name: r.attachment.name || a.name,
+      } : a)))
+    } catch (e) {
+      if (activeId.current !== forId) return
+      setAttachments((prev) => {
+        const found = prev.find((a) => a.key === key)
+        if (found?.localUrl) URL.revokeObjectURL(found.localUrl)
+        return prev.filter((a) => a.key !== key)
+      })
+      toast(e.message || tr('Could not attach this file'))
+    }
+  }
 
   const addAttachments = (fileList) => {
     const files = Array.from(fileList || [])
     if (!files.length) return
-    setAttachments((prev) => [...prev, ...files.map((file) => ({
-      file, url: file.type.startsWith('image/') ? URL.createObjectURL(file) : null,
-    }))])
+    const forId = id
+    const entries = files.map((file) => ({
+      key: `att${++attachSeq.current}`,
+      name: file.name,
+      localUrl: canPreviewLocally(file.type) ? URL.createObjectURL(file) : null,
+      id: null,
+      status: 'uploading',
+      original_size: file.size,
+      size: file.size,
+      content_type: file.type,
+      original_type: file.type,
+      converted: false,
+      reduced: false,
+      adjustable: false,
+      width: null,
+      height: null,
+      fitted: false,
+    }))
+    setAttachments((prev) => [...prev, ...entries])
+    entries.forEach((entry, i) => stageFile(forId, files[i], entry.key))
   }
-
-  // Files that can travel in an MMS; the same set the attach button's picker offers.
-  const isSendableFile = (file) => /^(image|audio|video)\//.test(file.type)
-    || ['text/vcard', 'text/x-vcard'].includes(file.type)
 
   // Clipboard images (screenshots, "copy image") all arrive named image.png or with no name
   // at all; give each a distinct, dated name so several pasted pictures stay tellable apart.
@@ -128,7 +229,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   // file items of the clipboard are taken, and the default is prevented only when the
   // clipboard holds nothing but files.
   const takeFiles = (files, event) => {
-    const usable = files.filter(isSendableFile)
+    const usable = files.filter((f) => isAttachable(f, mmsFormats))
     if (!usable.length) return false
     if (sending) { event.preventDefault(); return true }
     if (mmsDisabled) {
@@ -158,18 +259,33 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
     takeFiles(files, event)
   }
 
-  const removeAttachment = (index) => {
+  // Best-effort DELETE on the gateway -- the composer's own view of the attachment is already
+  // gone (or about to be) either way, so a failure here (network blip, already swept) is not
+  // worth surfacing.
+  const removeAttachment = (key) => {
+    const forId = id
     setAttachments((prev) => {
-      const next = prev.slice()
-      const [removed] = next.splice(index, 1)
-      if (removed?.url) URL.revokeObjectURL(removed.url)
-      return next
+      const found = prev.find((a) => a.key === key)
+      if (found?.localUrl) URL.revokeObjectURL(found.localUrl)
+      if (found?.id) api.removeMmsAttachment(forId, found.id).catch(() => {})
+      return prev.filter((a) => a.key !== key)
     })
   }
 
   // Object URLs are per-attachment, so they must be revoked individually on removal/clear
   // (above) and, for whatever is still queued, once when the component itself unmounts.
-  useEffect(() => () => { attachmentsRef.current.forEach((a) => a.url && URL.revokeObjectURL(a.url)) }, [])
+  useEffect(() => () => { attachmentsRef.current.forEach((a) => a.localUrl && URL.revokeObjectURL(a.localUrl)) }, [])
+
+  // Attachments staged for the composer belong to one line. If the operator switches lines,
+  // or leaves the page, before sending, delete whatever finished uploading on the gateway
+  // (best effort) rather than leaving it there until the sweep interval; this runs on the old
+  // line's attachments before the id-change effect below resets state for the new one.
+  useEffect(() => {
+    const forId = id
+    return () => {
+      attachmentsRef.current.forEach((a) => { if (a.id) api.removeMmsAttachment(forId, a.id).catch(() => {}) })
+    }
+  }, [id])
 
   const loadMsgs = useCallback(async (p, showLoading = false) => {
     if (!id || !p) return
@@ -191,8 +307,9 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   useEffect(() => {
     ++threadsRequest.current; ++messagesRequest.current
     setThreads([]); setPeer(null); setMsgs([]); setText(''); setNewTo(''); setTransport('auto')
+    setComposing(false)
     setBinary([])
-    clearAttachments(); setSubject(''); setMmsCfg(null)
+    clearAttachments(); setSubject(''); setMmsCfg(null); setMmsFormats(FALLBACK_FORMATS)
     setThreadsLoading(Boolean(id)); setMessagesLoading(false)
     if (id) { loadThreads(true); loadBinary(); loadMmsCfg() }
   }, [id, loadThreads, loadBinary, loadMmsCfg, clearAttachments])
@@ -203,7 +320,13 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
     ++messagesRequest.current
     setMsgs([])
     setMessagesLoading(Boolean(peer))
-    if (peer) loadMsgs(peer, true)
+    if (peer) {
+      loadMsgs(peer, true)
+      if (unreadRef.current[peer]) {
+        setUnread((current) => { const next = { ...current }; delete next[peer]; return next })
+        api.markThreadRead(id, { peer }).then(() => refreshUnread?.()).catch(() => {})
+      }
+    }
   }, [peer, loadMsgs])
   // Open every conversation at its newest message, and keep following it as messages
   // arrive or MMS thumbnails finish loading (which grows the list after the first paint).
@@ -243,34 +366,131 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   useEffect(() => { if (!msgs.length) { setSelMode(false); setSelIds(new Set()) } }, [msgs.length])
   useEffect(() => subscribe((msg) => {
     if (msg.type === 'sms' && msg.instance === id) {
-      loadThreads()
+      // A message arriving in the conversation on screen is read as it arrives; counting it as
+      // unread would badge something the reader is looking at. Only while the page is visible:
+      // in a background tab or behind a locked screen nobody sees it, so it stays unread until
+      // the page is looked at again (below).
+      const onScreen = peer && msg.message?.direction === 'in' && msg.message?.peer === peer
+        && document.visibilityState === 'visible'
+      const marked = onScreen ? api.markThreadRead(id, { peer }).catch(() => {}) : Promise.resolve()
+      marked.then(() => { loadThreads(); if (onScreen) refreshUnread?.() })
       loadBinary()
       if (peer) loadMsgs(peer)
     }
-  }), [subscribe, id, peer, loadThreads, loadMsgs, loadBinary])
+  }), [subscribe, id, peer, loadThreads, loadMsgs, loadBinary, refreshUnread])
+
+  // Coming back to a page left on a conversation reads what arrived there in the meantime.
+  useEffect(() => {
+    if (!peer) return undefined
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible' || !unreadRef.current[peer]) return
+      setUnread((current) => { const next = { ...current }; delete next[peer]; return next })
+      api.markThreadRead(id, { peer }).then(() => refreshUnread?.()).catch(() => {})
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [id, peer, refreshUnread])
+
+  const markAllRead = async () => {
+    setUnread({})
+    try { await api.markThreadRead(id, { all: true }) } catch {}
+    loadThreads()
+    refreshUnread?.()
+  }
+
+  // The ids ready to send, as a stable string: attachments still uploading are excluded, and
+  // the effects below key off this string (not the `attachments` array reference) so an
+  // in-place field update from a fit response — same ids, new sizes — does not itself
+  // re-trigger another fit.
+  const readyIds = useMemo(
+    () => attachments.filter((a) => a.status === 'ready' && a.id).map((a) => a.id),
+    [attachments])
+  const readyIdsKey = readyIds.join(',')
+
+  // Ask the gateway what the composed MMS would actually carry: it converts and shrinks the
+  // staged attachments together against this line's limit. Stale responses (a later fit, or a
+  // line switch, already superseded this one) are ignored via the request counter and
+  // activeId, same pattern as loadThreads/loadMsgs above.
+  const runFit = useCallback(async () => {
+    const forId = id
+    const ids = attachmentsRef.current.filter((a) => a.status === 'ready' && a.id).map((a) => a.id)
+    if (!ids.length) { setFit(null); return }
+    const request = ++fitRequest.current
+    setFitPending(true)
+    try {
+      const r = await api.fitMmsAttachments(forId, {
+        ids, text: textRef.current, subject: subjectRef.current, to: recipientRef.current,
+        split: splitRef.current,
+      })
+      if (request !== fitRequest.current || activeId.current !== forId) return
+      setFit({ size: r.size, limit: r.limit, fits: r.fits, problem: r.problem,
+        split: Boolean(r.split), count: (r.messages || []).length || 1 })
+      const byId = new Map((r.attachments || []).map((a) => [a.id, a]))
+      setAttachments((prev) => prev.map((a) => {
+        const info = a.id && byId.get(a.id)
+        return info ? { ...a, ...info, id: a.id, status: 'ready', fitted: true } : a
+      }))
+    } catch (e) {
+      if (request !== fitRequest.current || activeId.current !== forId) return
+      if (e.status === 404) {
+        // The id named in the 404 detail ("no such attachment: <id>") was swept server-side;
+        // drop it and let the resulting readyIdsKey change schedule a fit with what remains.
+        const missing = String(e.message || '').split(':').pop().trim()
+        setAttachments((prev) => prev.filter((a) => a.id !== missing))
+        return
+      }
+      setFit((prev) => ({ size: prev?.size || 0, limit: prev?.limit || 0, fits: false,
+        problem: e.message || String(e) }))
+    } finally {
+      if (request === fitRequest.current && activeId.current === forId) setFitPending(false)
+    }
+  }, [id])
+
+  const scheduleFit = useCallback((delay) => {
+    if (fitTimer.current) clearTimeout(fitTimer.current)
+    fitTimer.current = setTimeout(runFit, delay)
+  }, [runFit])
+  useEffect(() => () => { if (fitTimer.current) clearTimeout(fitTimer.current) }, [])
+
+  // Re-fit whenever the set of ready attachments changes (an upload finished, one was
+  // removed, one was swept) -- quickly, since this is usually the operator directly acting on
+  // the composer.
+  useEffect(() => {
+    if (!readyIdsKey) { setFit(null); return }
+    scheduleFit(300)
+  }, [readyIdsKey, scheduleFit])
+  // Re-fit on a draft edit while attachments exist -- more slowly, since text/subject/
+  // recipient change on every keystroke and the packaged size only needs to catch up once
+  // typing pauses. Deliberately excludes readyIdsKey: that case is handled by the effect
+  // above, at its own shorter delay.
+  useEffect(() => {
+    if (!readyIdsKey) return
+    scheduleFit(800)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [text, subject, peer, newTo, scheduleFit])
+  // Switching between one MMS and one each re-plans every attachment from its original; the
+  // sizes and thumbnails shown until that answer arrives are the other mode's, so sending
+  // waits for it (fitPending).
+  useEffect(() => {
+    if (!readyIdsKey) return
+    scheduleFit(0)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [splitMms, scheduleFit])
 
   const sendMms = async (to) => {
     const forId = id
     sendingRef.current = true
     setSending(true)
     try {
-      const maxSize = mmsCfg?.max_size || 300 * 1024
-      const textBytes = new TextEncoder().encode(text || '').length
-      let files
-      try {
-        files = await fitAttachments(attachments.map((a) => a.file), textBytes, maxSize)
-      } catch (e) {
-        const kb = (n) => Math.ceil((n || 0) / 1024)
-        showToast ? showToast(tr('The attachments are too large for an MMS ({size} KB; limit {limit} KB)',
-          { size: kb(e.size), limit: kb(maxSize) })) : alert(e.message)
-        return
-      }
-      const res = await api.sendMms(forId, { to, text, subject, files })
+      const attachment_ids = attachmentsRef.current.filter((a) => a.status === 'ready' && a.id).map((a) => a.id)
+      const split = splitRef.current && attachment_ids.length > 1
+      const res = await api.sendMms(forId, { to, text, subject, attachment_ids, split })
       // The backend may canonicalize the peer differently from what was typed: a single
       // recipient is normalized (canonical_peer), and several recipients are joined with
       // ", " — read the stored message's own peer back rather than assuming it matches `to`.
       const peerKey = res?.message?.peer || to
       if (activeId.current === forId) {
+        // The gateway already removed the sent uploads; only the local view needs clearing.
         setText(''); setSubject(''); clearAttachments(); setPeer(peerKey); setNewTo('')
         stickToBottom.current = true
         await loadThreads(); await loadMsgs(peerKey)
@@ -280,6 +500,8 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
         showToast ? showToast(msg) : alert(msg)
       }
     } catch (e) {
+      // Sending failed (e.g. the gateway's fit at send time found a problem) -- keep the
+      // attachments staged so the operator can adjust the draft and retry.
       const msg = 'MMS failed: ' + e.message
       showToast ? showToast(msg) : alert(msg)
     } finally {
@@ -294,7 +516,10 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
     if (sendingRef.current) return
     const to = peer || newTo
     if (!to || (!text && !attachments.length)) return
-    if (attachments.length) { await sendMms(to); return }
+    if (attachments.length) {
+      if (attachmentsBusy) return
+      await sendMms(to); return
+    }
     const forId = id
     sendingRef.current = true
     setSending(true)
@@ -381,6 +606,23 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
     } catch (e) { toast('Delete failed: ' + e.message) }
   }
 
+  // On a phone the list and the conversation are one screen at a time (see .u-messages-split).
+  // A new message has no peer yet, so the open pane is "a peer or composing". Opening it pushes
+  // a history entry, so the system back gesture returns to the list instead of leaving the page.
+  const paneOpen = Boolean(peer) || composing
+  const closePane = useCallback(() => {
+    setPeer(null); setMsgs([]); setMessagesLoading(false); setComposing(false)
+  }, [])
+  useEffect(() => {
+    if (!paneOpen || !window.matchMedia('(max-width: 760px)').matches) return undefined
+    window.history.pushState({ mddMessagesPane: true }, '')
+    window.addEventListener('popstate', closePane)
+    return () => {
+      window.removeEventListener('popstate', closePane)
+      if (window.history.state?.mddMessagesPane) window.history.back()
+    }
+  }, [paneOpen, closePane])
+
   if (initialLoading && !id) return <p role="status">{tr('Loading')}…</p>
   if (loadErrors?.instances && !id) return <p className="u-error">{tr('Loading failed')}</p>
   if (!id) return (
@@ -395,24 +637,31 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
       <div style={{ flexShrink: 0 }}>
         <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} />
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gridTemplateRows: 'minmax(0, 1fr)', gap: 16, flex: 1, minHeight: 0 }}>
-      <div className="card" style={{ padding: 12, overflow: 'auto', minHeight: 0 }}>
-        <button className="btn btn-primary" style={{ width: '100%', marginBottom: 8 }} onClick={() => { setPeer(null); setMsgs([]); setMessagesLoading(false) }}>+ {tr('New message')}</button>
+      <div className={`u-messages-split ${paneOpen ? 'in-conversation' : ''}`}>
+      <div className="card u-messages-list" style={{ padding: 12, overflow: 'auto', minHeight: 0 }}>
+        <button className="btn btn-primary" style={{ width: '100%', marginBottom: 8 }} onClick={() => { setPeer(null); setMsgs([]); setMessagesLoading(false); setComposing(true) }}>+ {tr('New message')}</button>
         {threads.length > 0 &&
           <button className="btn btn-ghost" style={{ width: '100%', marginBottom: 10, color: '#ef4444', fontSize: 12 }}
             onClick={clearAll}>{tr('Clear all conversations')}</button>}
         <button className="btn btn-ghost" style={{ width: '100%', marginBottom: 10, fontSize: 12 }}
           onClick={() => setShowMmsSettings(true)}>{tr('MMS settings')}</button>
+        {Object.keys(unread).length > 0 &&
+          <button className="btn btn-ghost" style={{ width: '100%', marginBottom: 10, fontSize: 12 }}
+            onClick={markAllRead}>{tr('Mark all read')}</button>}
         {threads.map((t) => (
-          <div key={t.peer} onClick={() => setPeer(t.peer)} className="hover-row"
-            style={{ padding: 10, borderRadius: 10, cursor: 'pointer', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 8,
-              background: peer === t.peer ? 'var(--active)' : 'transparent' }}>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontWeight: 600, fontSize: 14 }} className="mono">{t.peer}</div>
-              <div style={{ fontSize: 12, color: 'var(--text-mute)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          // The row is a button, not a div that happens to listen for clicks: a touch device
+          // delivers a click to an element that is actually interactive, and a keyboard can
+          // reach it. The delete button sits beside it rather than inside it, because a button
+          // within a button is not valid and behaves differently in every browser.
+          <div key={t.peer} className="hover-row u-thread-row"
+            style={{ background: peer === t.peer ? 'var(--active)' : 'transparent' }}>
+            <button type="button" className="u-thread-open" onClick={() => { setPeer(t.peer); setComposing(false) }}>
+              <span style={{ fontWeight: 600, fontSize: 14 }} className={contactNames[t.peer] ? '' : 'mono'}>{contactNames[t.peer] || t.peer}</span>
+              <span style={{ fontSize: 12, color: 'var(--text-mute)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {t.last_kind === 'mms' ? `[${tr('MMS')}]${t.last_body ? ' ' + t.last_body : ''}` : t.last_body}
-              </div>
-            </div>
+              </span>
+            </button>
+            {!!unread[t.peer] && <span className="u-thread-unread" aria-label={tr('{count} unread', { count: unread[t.peer] })}>{unread[t.peer]}</span>}
             <button className="row-del" title="Delete conversation" aria-label={`Delete conversation with ${t.peer}`}
               onClick={(e) => deleteThread(t.peer, e)}>🗑</button>
           </div>
@@ -422,9 +671,13 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
         <BinaryPayloads payloads={binary} tr={tr} />
       </div>
 
-      <div className="card" style={{ display: 'flex', flexDirection: 'column', padding: 0, minHeight: 0 }}>
+      <div className="card u-messages-thread" style={{ display: 'flex', flexDirection: 'column', padding: 0, minHeight: 0 }}>
         <div style={{ padding: 14, borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
-          {peer ? <span className="mono" style={{ fontWeight: 600, flex: 1 }}>{peer}</span>
+          {paneOpen && <button className="btn btn-ghost u-messages-back" aria-label={tr('Back to conversations')}
+            onClick={closePane}>‹</button>}
+          {peer ? <span className={contactNames[peer] ? '' : 'mono'} style={{ fontWeight: 600, flex: 1 }}>
+            {contactNames[peer] || peer}{contactNames[peer] && <small className="mono" style={{ marginLeft: 8, fontWeight: 500, color: 'var(--text-mute)' }}>{peer}</small>}
+          </span>
             : <input placeholder={tr('Recipient number e.g. +1...')} value={newTo} onChange={(e) => setNewTo(e.target.value)} style={{ maxWidth: 300, flex: 1 }} />}
           {peer && msgs.length > 0 && (
             selMode ? (
@@ -495,11 +748,24 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
                     {new Date(m.ts * 1000).toLocaleString()}
                     {m.transport === 'cellular' ? ` · ${tr('4G SMS')}` : ''}
                     {isMms ? ` · ${tr('MMS')}` : ''}
+                    {/* Shown incomplete, then made whole by a late part: it stays where it was
+                        read, so this mark is how the reader learns the text changed. */}
+                    {m.completed_ts ? <span style={{ cursor: 'help' }}
+                      title={tr('Part of this text arrived late and was added at {time}.', { time: new Date(m.completed_ts * 1000).toLocaleString() })}>
+                      {` · ${tr('Completed')}`}</span> : ''}
                     {statusText}
                   </div>
                   {failed && m.error && (
                     <div style={{ fontSize: 10.5, color: '#ef4444', marginTop: 1,
                       textAlign: m.direction === 'out' ? 'right' : 'left', maxWidth: 280 }}>{m.error}</div>
+                  )}
+                  {failed && m.transport === 'cellular' && /WmsMessageDeliveryFailure/.test(m.error || '') && (
+                    // The QMI name says only that the network refused the text. On VoLTE-only
+                    // carriers that is almost always the modem's IMS being off.
+                    <div style={{ fontSize: 10.5, color: 'var(--text-dim)', marginTop: 2,
+                      textAlign: m.direction === 'out' ? 'right' : 'left', maxWidth: 280 }}>
+                      {tr('The network refused this text. Carriers such as China Telecom carry 4G texts only over VoLTE/IMS; turn on Modem VoLTE / IMS on the device\'s 4G tab.')}
+                    </div>
                   )}
                   {uncertain && m.error && (
                     <div style={{ fontSize: 10.5, color: '#f59e0b', marginTop: 1,
@@ -516,17 +782,53 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
           style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: 12, borderTop: '1px solid var(--border)', flexShrink: 0 }}>
           {attachments.length > 0 && (
             <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-              {attachments.map((a, i) => (
-                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 4, background: 'var(--hover)',
-                  borderRadius: 8, padding: '4px 6px', fontSize: 11, maxWidth: 180 }}>
-                  {a.url
-                    ? <img src={a.url} alt="" style={{ width: 24, height: 24, objectFit: 'cover', borderRadius: 4, flexShrink: 0 }} />
-                    : <span style={{ flexShrink: 0 }}>📎</span>}
-                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.file.name}</span>
-                  <button className="btn btn-ghost" type="button" style={{ padding: '0 4px', fontSize: 11, flexShrink: 0 }}
-                    aria-label={tr('Remove attachment')} onClick={() => removeAttachment(i)}>✕</button>
-                </div>
+              {attachments.map((a) => {
+                const isImage = String(a.content_type || '').startsWith('image/')
+                const thumb = a.fitted && a.id && isImage && a.preview
+                  ? api.mmsAttachmentPreviewUrl(id, a.id, a.preview)
+                  : a.localUrl
+                const shrunk = a.status === 'ready' && (a.converted || a.size !== a.original_size)
+                const sizeText = a.status === 'uploading' ? tr('Uploading…')
+                  : shrunk ? `${formatBytes(a.original_size)} → ${formatBytes(a.size)}`
+                  : formatBytes(a.size)
+                const reducedNote = a.status === 'ready' && a.reduced
+                  ? tr('Made smaller: the gateway is short of memory') : ''
+                return (
+                  <div key={a.key} style={{ display: 'flex', alignItems: 'center', gap: 4, background: 'var(--hover)',
+                    borderRadius: 8, padding: '4px 6px', fontSize: 11, maxWidth: 200 }}>
+                    {thumb
+                      ? <img src={thumb} alt="" style={{ width: 24, height: 24, objectFit: 'cover', borderRadius: 4, flexShrink: 0 }} />
+                      : <span style={{ flexShrink: 0 }}>📎</span>}
+                    <span style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.name}</span>
+                      <span style={{ color: 'var(--text-mute)' }} title={reducedNote || undefined}>
+                        {sizeText}{reducedNote && ' ⚠'}
+                      </span>
+                    </span>
+                    <button className="btn btn-ghost" type="button" style={{ padding: '0 4px', fontSize: 11, flexShrink: 0 }}
+                      aria-label={tr('Remove attachment')} onClick={() => removeAttachment(a.key)}>✕</button>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+          {attachments.length > 1 && (
+            <div role="radiogroup" aria-label={tr('How to send the attachments')}
+              style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 11 }}>
+              {[[false, tr('One MMS')], [true, tr('One MMS per attachment')]].map(([value, label]) => (
+                <button key={String(value)} type="button" role="radio" aria-checked={splitMms === value}
+                  className={splitMms === value ? 'btn btn-primary' : 'btn btn-ghost'}
+                  disabled={sending} style={{ padding: '2px 8px', fontSize: 11 }}
+                  onClick={() => setSplitMms(value)}>{label}</button>
               ))}
+            </div>
+          )}
+          {attachments.length > 0 && fit && (
+            <div style={{ fontSize: 11, color: 'var(--text-mute)' }}>
+              {fit.split
+                ? tr('{count} MMS, each up to {limit}', { count: fit.count, limit: formatBytes(fit.limit) })
+                : tr('Total {size} of {limit}', { size: formatBytes(fit.size), limit: formatBytes(fit.limit) })}
+              {fit.problem && <div style={{ color: '#ef4444', marginTop: 2 }}>{fit.problem}</div>}
             </div>
           )}
           {attachments.length > 0 && (
@@ -535,7 +837,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
           )}
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             <input ref={fileInputRef} type="file" multiple
-              accept="image/*,audio/*,video/*,text/vcard,text/x-vcard"
+              accept={acceptAttribute(mmsFormats)}
               style={{ display: 'none' }}
               onChange={(e) => { addAttachments(e.target.files); e.target.value = '' }} />
             <button className="btn btn-ghost" type="button" disabled={sending || mmsDisabled}
@@ -567,7 +869,9 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
                 e.preventDefault()
                 if (!e.repeat) send()
               }} style={{ flex: '1 1 220px' }} />
-            <button className="btn btn-primary" disabled={sending || (!peer && !newTo) || (!text && !attachments.length)}
+            <button className="btn btn-primary"
+              disabled={sending || (!peer && !newTo) || (!text && !attachments.length)
+                || (attachments.length > 0 && attachmentsBusy)}
               onClick={send}>{tr('Send')}</button>
           </div>
         </div>
@@ -610,30 +914,59 @@ function MmsContent({ m, id, tr, busy, onDownload }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
       {mms.subject && <div style={{ fontWeight: 700, fontSize: 12 }}>{mms.subject}</div>}
-      {parts.map((p) => {
-        const type = String(p.content_type || '')
-        const url = api.mmsPartUrl(id, m.id, p.id)
-        if (type.startsWith('image/')) {
-          return (
-            <a key={p.id} href={url} target="_blank" rel="noreferrer">
-              <img src={url} alt={p.name || ''} style={{ maxWidth: 240, maxHeight: 240, borderRadius: 8, display: 'block' }} />
-            </a>
-          )
-        }
-        if (type.startsWith('audio/')) return <audio key={p.id} controls src={url} style={{ maxWidth: 240 }} />
-        if (type.startsWith('video/')) return <video key={p.id} controls src={url} style={{ maxWidth: 240, borderRadius: 8 }} />
-        return (
-          <a key={p.id} href={api.mmsPartUrl(id, m.id, p.id, true)} download={p.name || true}
-            style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, background: 'rgba(0,0,0,.08)',
-              borderRadius: 8, padding: '6px 8px', textDecoration: 'none', color: 'inherit' }}>
-            <span>📄</span>
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 160 }}>{p.name || type}</span>
-            {p.size ? <span className="mono" style={{ opacity: 0.75 }}>{Math.ceil(p.size / 1024)} KB</span> : null}
-          </a>
-        )
-      })}
+      {parts.map((p) => (
+        <MmsPart key={p.id} p={p} url={api.mmsPartUrl(id, m.id, p.id)}
+          downloadUrl={api.mmsPartUrl(id, m.id, p.id, true)} tr={tr} />
+      ))}
       {m.body ? <div>{m.body}</div> : null}
     </div>
+  )
+}
+
+// Whether a browser can attempt to play an audio/video part inline: a codec-level check, since
+// an unsupported <audio>/<video> src otherwise fails silently (a blank player, not an error)
+// rather than raising onError. Images have no such check -- the <img> itself decides, via onError.
+function canPlayInline(tag, type) {
+  if (typeof document === 'undefined' || !type) return false
+  try { return Boolean(document.createElement(tag).canPlayType(type)) } catch { return false }
+}
+
+// One MMS part: an inline image/audio/video when the part says a browser can reasonably show
+// it (older backends omit `preview`, which keeps today's always-inline behaviour) and, for
+// audio/video, this browser can actually play the type -- otherwise, or if the inline element
+// itself fails to load, the same download card every other part type gets, with a note that
+// there is nothing to preview.
+function MmsPart({ p, url, downloadUrl, tr }) {
+  const type = String(p.content_type || '')
+  const isImage = type.startsWith('image/')
+  const isAudio = type.startsWith('audio/')
+  const isVideo = type.startsWith('video/')
+  const [failed, setFailed] = useState(false)
+  const previewable = p.preview !== false
+    && (isImage || (isAudio && canPlayInline('audio', type)) || (isVideo && canPlayInline('video', type)))
+  if (!failed && previewable) {
+    if (isImage) {
+      return (
+        <a href={url} target="_blank" rel="noreferrer">
+          <img src={url} alt={p.name || ''} onError={() => setFailed(true)}
+            style={{ maxWidth: 240, maxHeight: 240, borderRadius: 8, display: 'block' }} />
+        </a>
+      )
+    }
+    if (isAudio) return <audio controls src={url} onError={() => setFailed(true)} style={{ maxWidth: 240 }} />
+    if (isVideo) return <video controls src={url} onError={() => setFailed(true)} style={{ maxWidth: 240, borderRadius: 8 }} />
+  }
+  return (
+    <a href={downloadUrl} download={p.name || true}
+      style={{ display: 'flex', flexDirection: 'column', gap: 1, fontSize: 12, background: 'rgba(0,0,0,.08)',
+        borderRadius: 8, padding: '6px 8px', textDecoration: 'none', color: 'inherit' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span>📄</span>
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 160 }}>{p.name || type}</span>
+        {p.size ? <span className="mono" style={{ opacity: 0.75 }}>{Math.ceil(p.size / 1024)} KB</span> : null}
+      </div>
+      {(isImage || isAudio || isVideo) && <span style={{ fontSize: 10, color: 'var(--text-mute)' }}>{tr('Preview not available')}</span>}
+    </a>
   )
 }
 

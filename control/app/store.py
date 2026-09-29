@@ -16,9 +16,17 @@ import sqlite3
 import threading
 import time
 
+from . import contacts as contacts_format
 from . import mms_media, sms_pdu
 
 DATA_DIR = os.environ.get("MDD_DATA", os.path.join(os.getcwd(), "data"))
+
+# Rows that belong to somebody rather than to the gateway -- the address book, and anything
+# else that is one person's view of shared data -- carry an owner. This gateway has a single
+# administrator, so that owner is the same everywhere; naming it in the
+# data, and in every query, keeps the ownership explicit rather than leaving it as an
+# assumption spread across the callers.
+ADMIN_OWNER = 1
 DB_PATH = os.path.join(DATA_DIR, "mdd-sim-gateway.sqlite")
 PREVIOUS_DB_PATH = os.path.join(DATA_DIR, "vowifi.sqlite")
 _lock = threading.Lock()
@@ -238,6 +246,9 @@ def init():
                     ts INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_msg_inst_peer ON messages(instance, peer, ts);
+                -- What unread_counts walks: a line's inbound messages in arrival order, so
+                -- counting what is new reads only those rows, not the line's whole history.
+                CREATE INDEX IF NOT EXISTS idx_msg_inst_dir_id ON messages(instance, direction, id);
                 -- The identity of every message ever stored, kept when the message itself is
                 -- deleted: a text the modem still holds, or a carrier re-delivery, must not
                 -- bring back what the user removed. `fingerprint` is exact (network timestamp
@@ -420,6 +431,65 @@ def init():
                     listened INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_voicemails_inst ON voicemails(instance, ts);
+                -- An address book belongs to whoever keeps it, not to the gateway, so every
+                -- row says whose it is and every query names an owner. See ADMIN_OWNER.
+                CREATE TABLE IF NOT EXISTS contacts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner INTEGER NOT NULL,         -- whose book it is
+                    name TEXT NOT NULL,
+                    company TEXT NOT NULL DEFAULT '',
+                    note TEXT NOT NULL DEFAULT '',
+                    created_ts INTEGER NOT NULL,
+                    updated_ts INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_contacts_owner ON contacts(owner, name);
+                -- How far a reader has got through each conversation. "Read" is something a
+                -- person did, not a property of the message, and the messages table has no
+                -- column that could hold it and still be true for whoever looks next -- so it
+                -- is recorded against an owner, like the address book above. See ADMIN_OWNER.
+                --
+                -- `peer` empty is a line-wide baseline ("everything up to here is read"), which
+                -- is what "mark all read" writes and what a client uses on its first run so an
+                -- upgrade does not present years of history as unread.
+                --
+                -- The position is a message id, not a timestamp. An inbound SMS carries the
+                -- network's own timestamp, so a delayed message can arrive with a time older
+                -- than one already read -- and a timestamp marker would file it as read before
+                -- anybody saw it. Ids follow arrival, which is what "new" actually means here.
+                CREATE TABLE IF NOT EXISTS message_reads (
+                    owner INTEGER NOT NULL,
+                    instance TEXT NOT NULL,
+                    peer TEXT NOT NULL,
+                    last_read_id INTEGER NOT NULL,
+                    PRIMARY KEY (owner, instance, peer)
+                );
+                -- `number` is what the person typed, and what is shown back to them.
+                -- `match_key` is what an arriving number is compared against on any line:
+                -- contacts.number_key without a country, which is E.164 when the number is
+                -- written internationally and the digits as written when it is not.
+                CREATE TABLE IF NOT EXISTS contact_numbers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contact_id INTEGER NOT NULL,
+                    label TEXT NOT NULL DEFAULT '',
+                    number TEXT NOT NULL,
+                    match_key TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_contact_numbers_contact
+                    ON contact_numbers(contact_id);
+                CREATE INDEX IF NOT EXISTS idx_contact_numbers_match
+                    ON contact_numbers(match_key);
+                -- The keys a nationally written number has in each country the gateway has a
+                -- line in, where they differ from match_key (contacts.number_keys). Derived from
+                -- `number` and rebuilt whenever those countries change (contacts_rekey).
+                CREATE TABLE IF NOT EXISTS contact_number_keys (
+                    number_id INTEGER NOT NULL,
+                    region TEXT NOT NULL,
+                    match_key TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_contact_number_keys_number
+                    ON contact_number_keys(number_id);
+                CREATE INDEX IF NOT EXISTS idx_contact_number_keys_match
+                    ON contact_number_keys(region, match_key);
                 """
             )
             # migration: per-message failure detail (added later)
@@ -699,8 +769,34 @@ def _identity_indexes(c) -> None:
 
 
 # The last step is defined further down with the MMS store it relies on, hence the lambda.
+def _migration_read_baseline(c) -> None:
+    """Everything already stored when read state arrives counts as read.
+
+    Without this an upgrade would present every conversation in the history as unread, since
+    nobody has read anything by a record that did not exist until now. The baseline is the
+    line-wide marker (peer empty) at the newest message each line has, so what arrives after
+    the upgrade is new, and nothing before it is.
+    """
+    c.execute("INSERT OR IGNORE INTO message_reads(owner,instance,peer,last_read_id) "
+              "SELECT ?, instance, '', MAX(id) FROM messages GROUP BY instance",
+              (ADMIN_OWNER,))
+
+
+def _migration_completed_ts(c) -> None:
+    """When a late part completed a message that had been shown incomplete (set_message_body).
+
+    Kept on the message rather than only announced, so a page loaded later and a native client
+    can both still say the text was completed after it first appeared.
+    """
+    try:
+        c.execute("ALTER TABLE messages ADD COLUMN completed_ts INTEGER")
+    except sqlite3.OperationalError:
+        pass
+
+
 _MIGRATIONS = (_migration_message_identity, _migration_modem_object_on_message, _migration_mms,
-               _migration_identity_scope, lambda c: _migration_filed_mms_pushes(c))
+               _migration_identity_scope, lambda c: _migration_filed_mms_pushes(c),
+               _migration_read_baseline, _migration_completed_ts)
 
 
 def _sweep_binary_messages(c) -> int:
@@ -1145,12 +1241,21 @@ def _insert_message(c, instance: str, direction: str, peer: str, body: str, *, s
             "received_ts": int(received_ts)}
 
 
-def set_message_body(mid: int, body: str) -> dict | None:
-    """Replace a stored message's text and return the record as it now reads."""
+def set_message_body(mid: int, body: str, completed_ts: int | None = None) -> dict | None:
+    """Replace a stored message's text and return the record as it now reads.
+
+    `completed_ts` records that this text is now whole after being shown with parts missing.
+    The message keeps its place, its time and its read state; the mark is how a reader learns it
+    changed.
+    """
     with _lock, _conn() as c:
-        c.execute("UPDATE messages SET body=? WHERE id=?", (body, int(mid)))
+        if completed_ts is None:
+            c.execute("UPDATE messages SET body=? WHERE id=?", (body, int(mid)))
+        else:
+            c.execute("UPDATE messages SET body=?, completed_ts=? WHERE id=?",
+                      (body, int(completed_ts), int(mid)))
         row = c.execute(
-            "SELECT id,instance,direction,peer,body,status,error,ts,transport,kind "
+            "SELECT id,instance,direction,peer,body,status,error,ts,transport,kind,completed_ts "
             "FROM messages WHERE id=?", (int(mid),)).fetchone()
         if row and (row["kind"] or "sms") == "sms":
             # The text grew, so its identity did too; the identity of the partial text stays
@@ -1662,8 +1767,9 @@ def _mms_public(row, parts) -> dict:
         record["delivery"] = {}
     # The MMSC location is a bearer credential for the content; the browser never needs it.
     record.pop("content_location", None)
-    record["parts"] = [{k: p[k] for k in ("id", "seq", "content_type", "name", "content_id",
-                                          "charset", "size", "text")} for p in parts]
+    record["parts"] = [{**{k: p[k] for k in ("id", "seq", "content_type", "name", "content_id",
+                                             "charset", "size", "text")},
+                        "preview": mms_media.previewable(p["content_type"])} for p in parts]
     return record
 
 
@@ -2571,3 +2677,337 @@ def clear_line_states(instance: str) -> int:
     with _lock, _conn() as c:
         cur = c.execute("DELETE FROM line_states WHERE instance=?", (str(instance),))
         return cur.rowcount
+
+
+# ----------------------------- address book -----------------------------
+# Where a contact's numbers are found by key: match_key on every line, and the per-country keys
+# only on a line in that country (contacts.number_keys). `region` is the arriving line's.
+_CONTACT_KEY_ROWS = (
+    "SELECT contact_numbers.contact_id AS contact_id, contact_numbers.match_key AS key "
+    "FROM contact_numbers WHERE contact_numbers.match_key IN ({keys}) "
+    "UNION ALL "
+    "SELECT contact_numbers.contact_id, contact_number_keys.match_key "
+    "FROM contact_number_keys "
+    "JOIN contact_numbers ON contact_numbers.id = contact_number_keys.number_id "
+    "WHERE contact_number_keys.region {region} AND contact_number_keys.match_key IN ({keys})")
+
+
+def _contact_numbers(c, ids) -> dict[int, list[dict]]:
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = c.execute(f"SELECT contact_id,label,number FROM contact_numbers "
+                     f"WHERE contact_id IN ({placeholders}) ORDER BY id", tuple(ids)).fetchall()
+    out: dict[int, list[dict]] = {}
+    for row in rows:
+        out.setdefault(int(row["contact_id"]), []).append(
+            {"label": row["label"] or "", "number": row["number"]})
+    return out
+
+
+def _contact_docs(c, rows) -> list[dict]:
+    numbers = _contact_numbers(c, [int(r["id"]) for r in rows])
+    return [{"id": int(r["id"]), "name": r["name"], "company": r["company"] or "",
+             "note": r["note"] or "", "updated_ts": int(r["updated_ts"] or 0),
+             "numbers": numbers.get(int(r["id"]), [])} for r in rows]
+
+
+def _contacts_by_key(c, owner: int, keys, region: str | None, extra: str = "",
+                     limit: int | None = None) -> list:
+    """The owner's contacts holding one of `keys`, by name then id.
+
+    `region` is the arriving line's country: its per-country keys are searched and no other
+    country's. None searches every country's -- right for the owner's own search and for telling
+    whether an import is somebody already in the book, never for naming a caller.
+    """
+    keys = sorted({k for k in keys if k})
+    if not keys:
+        return []
+    placeholders = ",".join("?" for _ in keys)
+    region_clause, region_args = ("IS NOT NULL", ()) if region is None else ("= ?", (region,))
+    union = _CONTACT_KEY_ROWS.format(keys=placeholders, region=region_clause)
+    sql = (f"SELECT contacts.*, matched.key AS matched_key FROM ({union}) AS matched "
+           f"JOIN contacts ON contacts.id = matched.contact_id "
+           f"WHERE contacts.owner=? {extra} ORDER BY contacts.name COLLATE NOCASE, contacts.id")
+    args = (*keys, *region_args, *keys, int(owner))
+    if limit is not None:
+        sql += " LIMIT ?"
+        args += (int(limit),)
+    return c.execute(sql, args).fetchall()
+
+
+def contacts_list(owner: int, query: str = "", limit: int = 1000, regions=()) -> list[dict]:
+    """The owner's contacts, optionally narrowed by name, company or number.
+
+    `regions` lets a search typed in national form -- "07700 900123" -- reach a contact stored
+    as +447700900123, in whichever of the gateway's countries it is a number.
+    """
+    text = str(query or "").strip()
+    with _lock, _conn() as c:
+        if not text:
+            rows = c.execute("SELECT * FROM contacts WHERE owner=? ORDER BY name COLLATE NOCASE, id "
+                             "LIMIT ?", (int(owner), int(limit))).fetchall()
+            return _contact_docs(c, rows)
+        like = f"%{text}%"
+        digits = contacts_format.digits_of(text)
+        rows = c.execute(
+            "SELECT DISTINCT contacts.* FROM contacts "
+            "LEFT JOIN contact_numbers ON contact_numbers.contact_id = contacts.id "
+            "WHERE contacts.owner=? AND (contacts.name LIKE ? OR contacts.company LIKE ? "
+            "   OR contact_numbers.number LIKE ? OR (?<>'' AND contact_numbers.match_key LIKE ?)) "
+            "ORDER BY contacts.name COLLATE NOCASE, contacts.id LIMIT ?",
+            (int(owner), like, like, like, digits, f"%{digits}", int(limit))).fetchall()
+        # A search that looks like a number is also tried the way an arriving number is, so a
+        # national spelling finds an international one; a fragment such as "900123" is found by
+        # the suffix match above.
+        if digits:
+            rows = list(rows)
+            seen = {int(r["id"]) for r in rows}
+            for row in _contacts_by_key(c, owner, contacts_format.number_keys(text, regions)
+                                        .values(), None):
+                if int(row["id"]) not in seen:
+                    seen.add(int(row["id"]))
+                    rows.append(row)
+            rows.sort(key=lambda r: (str(r["name"]).casefold(), int(r["id"])))
+            rows = rows[:int(limit)]
+        return _contact_docs(c, rows)
+
+
+def contact_get(owner: int, contact_id: int) -> dict | None:
+    with _lock, _conn() as c:
+        rows = c.execute("SELECT * FROM contacts WHERE owner=? AND id=?",
+                         (int(owner), int(contact_id))).fetchall()
+        docs = _contact_docs(c, rows)
+        return docs[0] if docs else None
+
+
+def contacts_count(owner: int) -> int:
+    with _lock, _conn() as c:
+        return int(c.execute("SELECT COUNT(*) FROM contacts WHERE owner=?",
+                             (int(owner),)).fetchone()[0])
+
+
+def _drop_numbers(c, contact_ids) -> None:
+    ids = [int(i) for i in contact_ids]
+    for start in range(0, len(ids), 400):
+        chunk = ids[start:start + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        c.execute(f"DELETE FROM contact_number_keys WHERE number_id IN "
+                  f"(SELECT id FROM contact_numbers WHERE contact_id IN ({placeholders}))",
+                  tuple(chunk))
+        c.execute(f"DELETE FROM contact_numbers WHERE contact_id IN ({placeholders})",
+                  tuple(chunk))
+
+
+def _add_country_keys(c, number_id: int, keys: dict[str, str]) -> None:
+    c.executemany("INSERT INTO contact_number_keys(number_id,region,match_key) VALUES(?,?,?)",
+                  [(int(number_id), region, key) for region, key in keys.items() if region])
+
+
+def _add_numbers(c, contact_id: int, numbers, regions) -> None:
+    for item in numbers:
+        keys = contacts_format.number_keys(item["number"], regions)
+        cur = c.execute("INSERT INTO contact_numbers(contact_id,label,number,match_key) "
+                        "VALUES(?,?,?,?)",
+                        (int(contact_id), item.get("label") or "", item["number"], keys[""]))
+        _add_country_keys(c, int(cur.lastrowid), keys)
+
+
+def _write_numbers(c, contact_id: int, numbers, regions) -> None:
+    _drop_numbers(c, [contact_id])
+    _add_numbers(c, contact_id, numbers, regions)
+
+
+def contact_create(owner: int, contact: dict, regions=()) -> dict:
+    clean = contacts_format.normalize_contact(contact)
+    now = int(time.time())
+    with _lock, _conn() as c:
+        count = int(c.execute("SELECT COUNT(*) FROM contacts WHERE owner=?",
+                              (int(owner),)).fetchone()[0])
+        if count >= contacts_format.MAX_CONTACTS_PER_OWNER:
+            raise contacts_format.ContactError("this address book is full")
+        cur = c.execute("INSERT INTO contacts(owner,name,company,note,created_ts,updated_ts) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (int(owner), clean["name"], clean["company"], clean["note"], now, now))
+        contact_id = int(cur.lastrowid)
+        _write_numbers(c, contact_id, clean["numbers"], regions)
+        return {"id": contact_id, "updated_ts": now, **clean}
+
+
+def contact_update(owner: int, contact_id: int, contact: dict, regions=()) -> dict | None:
+    clean = contacts_format.normalize_contact(contact)
+    now = int(time.time())
+    with _lock, _conn() as c:
+        exists = c.execute("SELECT id FROM contacts WHERE owner=? AND id=?",
+                           (int(owner), int(contact_id))).fetchone()
+        if not exists:
+            return None
+        c.execute("UPDATE contacts SET name=?,company=?,note=?,updated_ts=? WHERE id=?",
+                  (clean["name"], clean["company"], clean["note"], now, int(contact_id)))
+        _write_numbers(c, int(contact_id), clean["numbers"], regions)
+        return {"id": int(contact_id), "updated_ts": now, **clean}
+
+
+def contact_delete(owner: int, contact_id: int) -> bool:
+    with _lock, _conn() as c:
+        cur = c.execute("DELETE FROM contacts WHERE owner=? AND id=?",
+                        (int(owner), int(contact_id)))
+        if cur.rowcount:
+            _drop_numbers(c, [int(contact_id)])
+        return bool(cur.rowcount)
+
+
+def contacts_resolve(owner: int, numbers, region: str = "") -> dict[str, dict]:
+    """Map each number as the caller wrote it to the contact it belongs to, if any.
+
+    Answering in the caller's own spelling is what lets a conversation list built from message
+    rows use the result without normalising anything itself. `region` is the country of the
+    line the numbers arrived on: a number written in national form is national to that country,
+    and a contact typed in national form is found through that country's key and no other's.
+    """
+    region = str(region or "").lower()
+    wanted: dict[str, list[str]] = {}
+    for number in numbers or []:
+        key = contacts_format.number_key(str(number), region)
+        if key:
+            wanted.setdefault(key, []).append(str(number))
+    if not wanted:
+        return {}
+    out: dict[str, dict] = {}
+    with _lock, _conn() as c:
+        keys = list(wanted)
+        for start in range(0, len(keys), 400):
+            for row in _contacts_by_key(c, owner, keys[start:start + 400], region):
+                for original in wanted.get(str(row["matched_key"]), []):
+                    out.setdefault(original, {"id": int(row["id"]), "name": row["name"]})
+    return out
+
+
+def contacts_rekey(regions=()) -> int:
+    """Rebuild every stored key for `regions`, the countries the gateway has lines in.
+
+    A number typed in national form has a key for each of them, and the set changes as lines are
+    added and removed and as a SIM reports where it is. The number as typed is kept, so the keys
+    can always be worked out again. Returns how many numbers' keys changed.
+    """
+    regions = contacts_format.as_regions(regions)
+    with _lock, _conn() as c:
+        stored: dict[int, dict[str, str]] = {}
+        for row in c.execute("SELECT id, match_key FROM contact_numbers").fetchall():
+            stored[int(row["id"])] = {"": row["match_key"]}
+        for row in c.execute("SELECT number_id, region, match_key FROM contact_number_keys"):
+            stored.setdefault(int(row["number_id"]), {})[row["region"]] = row["match_key"]
+        changed = 0
+        for row in c.execute("SELECT id, number FROM contact_numbers").fetchall():
+            number_id = int(row["id"])
+            keys = contacts_format.number_keys(row["number"], regions)
+            if keys == stored.get(number_id):
+                continue
+            changed += 1
+            c.execute("UPDATE contact_numbers SET match_key=? WHERE id=?", (keys[""], number_id))
+            c.execute("DELETE FROM contact_number_keys WHERE number_id=?", (number_id,))
+            _add_country_keys(c, number_id, keys)
+    return changed
+
+
+def _contact_shape(contact: dict) -> tuple:
+    """Everything an entry says, as written: what makes two entries the same entry."""
+    return (contact["name"], contact["company"], contact["note"],
+            sorted((item.get("label") or "", item["number"]) for item in contact["numbers"]))
+
+
+def contacts_import(owner: int, incoming, regions=()) -> dict:
+    """Add every contact in an import, skipping only an exact copy of an entry already here.
+
+    An import adds what the file says and does not decide for the owner which entries are the
+    same person: two people may share a number, one person may be in the book twice, and a
+    name may be spelled two ways. Only an entry identical in every field -- name, company, note,
+    and each number with its label, exactly as written -- is skipped, so importing one export
+    twice does not double the book.
+    """
+    added = skipped = 0
+    now = int(time.time())
+    with _lock, _conn() as c:
+        count = int(c.execute("SELECT COUNT(*) FROM contacts WHERE owner=?",
+                              (int(owner),)).fetchone()[0])
+        for contact in incoming:
+            clean = contacts_format.normalize_contact(contact)
+            rows = c.execute("SELECT * FROM contacts WHERE owner=? AND name=?",
+                             (int(owner), clean["name"])).fetchall()
+            if any(_contact_shape(doc) == _contact_shape(clean) for doc in _contact_docs(c, rows)):
+                skipped += 1
+                continue
+            if count >= contacts_format.MAX_CONTACTS_PER_OWNER:
+                raise contacts_format.ContactError("this address book is full")
+            cur = c.execute("INSERT INTO contacts(owner,name,company,note,created_ts,updated_ts) "
+                            "VALUES(?,?,?,?,?,?)",
+                            (int(owner), clean["name"], clean["company"], clean["note"], now, now))
+            _write_numbers(c, int(cur.lastrowid), clean["numbers"], regions)
+            count += 1
+            added += 1
+    return {"added": added, "skipped": skipped}
+
+
+# ----------------------------- read state -----------------------------
+def _newest_message_id(c, instance: str, peer: str | None) -> int:
+    if peer:
+        row = c.execute("SELECT MAX(id) AS newest FROM messages WHERE instance=? AND peer=?",
+                        (str(instance), str(peer))).fetchone()
+    else:
+        row = c.execute("SELECT MAX(id) AS newest FROM messages WHERE instance=?",
+                        (str(instance),)).fetchone()
+    return int((row["newest"] if row else 0) or 0)
+
+
+def mark_thread_read(owner: int, instance: str, peer: str, message_id: int | None = None) -> int:
+    """Record how far the owner has read a conversation, or the line when peer is empty.
+
+    Without an id, everything currently stored counts as read. The marker only moves forward:
+    opening an older message after a newer one arrived must not make the newer one unread again.
+    Nor does it move past what is stored: an id from the future would file a message as read
+    before it arrived.
+    """
+    with _lock, _conn() as c:
+        newest = _newest_message_id(c, instance, peer or None)
+        position = newest if message_id is None else max(0, min(int(message_id), newest))
+        c.execute(
+            "INSERT INTO message_reads(owner,instance,peer,last_read_id) VALUES(?,?,?,?) "
+            "ON CONFLICT(owner,instance,peer) DO UPDATE SET last_read_id=MAX(last_read_id,?)",
+            (int(owner), str(instance), str(peer), position, position))
+        row = c.execute("SELECT last_read_id FROM message_reads WHERE owner=? AND instance=? "
+                        "AND peer=?", (int(owner), str(instance), str(peer))).fetchone()
+    return int(row["last_read_id"]) if row else position
+
+
+def mark_line_read(owner: int, instance: str, message_id: int | None = None) -> int:
+    """Everything on this line is read, whatever the individual conversations say."""
+    return mark_thread_read(owner, instance, "", message_id)
+
+
+def unread_counts(owner: int, instance: str) -> dict[str, int]:
+    """Inbound messages the owner has not read, by conversation.
+
+    An outbound message is never unread -- it was sent from here. A conversation with nothing
+    unread is absent rather than zero, so the caller can treat the map as the set of unread ones.
+
+    A late part of a long SMS completes the message it belongs to in place: same id, same
+    place, same read state. That is deliberate (#193) -- a message the reader has seen does not
+    move -- and the message carries `completed_ts` instead, which the conversation shows.
+    """
+    with _lock, _conn() as c:
+        rows = c.execute(
+            """SELECT m.peer AS peer, COUNT(*) AS n FROM messages m
+               WHERE m.instance=? AND m.direction='in'
+                 AND m.id > COALESCE((SELECT last_read_id FROM message_reads r
+                                      WHERE r.owner=? AND r.instance=m.instance
+                                        AND r.peer=m.peer), 0)
+                 AND m.id > COALESCE((SELECT last_read_id FROM message_reads r
+                                      WHERE r.owner=? AND r.instance=m.instance AND r.peer=''), 0)
+               GROUP BY m.peer""",
+            (str(instance), int(owner), int(owner))).fetchall()
+    return {str(r["peer"]): int(r["n"]) for r in rows}
+
+
+def unread_total(owner: int, instances) -> int:
+    """One number for a badge: everything unread across the given lines."""
+    return sum(sum(unread_counts(owner, str(iid)).values()) for iid in instances)

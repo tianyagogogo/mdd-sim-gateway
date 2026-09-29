@@ -25,6 +25,22 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
     return c.display_name || c.modem_name || c.name || t('Unknown device')
   }
   const lineName = (i) => i.carrier || i.name || [i.mcc, i.mnc].filter(Boolean).join('-') || t('Unknown SIM')
+  // Calls and texts can go over 4G or VoWiFi, so a line's state is both paths. Showing only
+  // the VoWiFi line status called a SIM with working 4G "Stopped".
+  const statusText = (i) => {
+    const device = devices.find((d) => String(d.instance_id || '') === String(i.id))
+    const caps = device?.capabilities || {}
+    const parts = []
+    const cellular = caps.cellular?.actual
+    if (device && device.device_type !== 'reader' && cellular && cellular !== 'unsupported') {
+      parts.push(`4G ${t(`cap.${cellular}`)}`)
+    }
+    const vowifi = caps.vowifi || {}
+    if (vowifi.actual === 'off' && vowifi.support?.status === 'unsupported') parts.push(`VoWiFi ${t('cap.unsupported')}`)
+    else if (i.status?.label) parts.push(`VoWiFi ${t(i.status.label)}`)
+    else if (vowifi.actual) parts.push(`VoWiFi ${t(`cap.${vowifi.actual}`)}`)
+    return parts.length ? ` — ${parts.join(' · ')}` : ''
+  }
   const numberTail = (i) => String(i.msisdn || '').replace(/\D/g, '').slice(-4)
 
   // Calls/Messages own their useful default: choose the first live line here instead of in
@@ -43,7 +59,7 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
         {live.map((i) => {
           const c = sourceFor(i)
           const tail = numberTail(i)
-          const st = i.status?.label ? ` — ${t(i.status.label)}` : ''
+          const st = statusText(i)
           return <option key={i.id} value={i.id}>{deviceName(c)} · {lineName(i)}{tail ? ` · ••••${tail}` : ''}{st}</option>
         })}
       </select>

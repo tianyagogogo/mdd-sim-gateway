@@ -27,6 +27,11 @@ import urllib.request
 from pathlib import Path
 
 try:
+    from host import modem_probe
+except ImportError:  # run as host/mdd_orchestrator.py, with host/ itself on the path
+    import modem_probe
+
+try:
     import serial
 except ImportError:  # pragma: no cover - host installer provides pyserial
     serial = None
@@ -35,6 +40,13 @@ try:
     import yaml
 except ImportError:  # pragma: no cover - installer provides PyYAML
     yaml = None
+
+
+def load_yaml_text(text: str) -> dict:
+    """Parse with libyaml when PyYAML has it: the same safe schema, far less CPU. The country
+    egress re-reads a subscription of hundreds of nodes every few seconds."""
+    loader = getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
+    return yaml.load(text, Loader=loader) or {}
 
 # 0x8C7B (35963) is vpcd's own default port, which the distribution package hands to its
 # "Virtual PCD" reader. Two pcscd readers cannot listen on one port, so sharing that base
@@ -310,6 +322,10 @@ EXIT_RANK_WARMUP_SECONDS = float(os.environ.get("MDD_EXIT_RANK_WARMUP", "25"))
 # state that had not changed. When a cycle finds nothing to do the loop backs off, while still
 # waking on the base interval to stat the input documents so an operator action is never
 # delayed by more than one base tick.
+# sing-tun makes every tun it creates the host's catch-all resolver whenever resolvectl is
+# present (see release_tun_dns). It does so once, shortly after start; this bounds how long
+# the orchestrator keeps looking for that registration after sing-box (re)starts.
+TUN_DNS_WATCH_SECONDS = float(os.environ.get("MDD_TUN_DNS_WATCH", "60"))
 IDLE_INTERVAL_SECONDS = float(os.environ.get("MDD_IDLE_INTERVAL", "15"))
 # A modem is plugged in so its SIM can be read; cellular data is a per-device capability, not
 # the box's route to the internet. Set this when the modem genuinely IS the only uplink.
@@ -329,6 +345,18 @@ BRIDGE_RETRY_BASE_SECONDS = 15.0
 BRIDGE_RETRY_CEILING_SECONDS = 600.0
 BRIDGE_STABLE_SECONDS = 60.0
 BRIDGE_SETTLE_SECONDS = 5.0
+# ModemManager parks a modem in state "failed" when its initialisation fails, and does not try
+# again on its own. For these reasons the cause is inside the module (seen: QMI clients left
+# behind by a ModemManager restart mid-probe, "unknown-capabilities"), and a module reboot
+# clears it. Other reasons (sim-missing, sim-error, esim-without-profiles) are not fixed by a
+# reboot and are only reported. Each reboot also interrupts that modem's VoWiFi (about a minute
+# and a half on the test gateway until it registered again), so they are spaced out and bounded,
+# and only made while the device is meant to be on the cellular network: in flight mode nothing
+# needs ModemManager, and the reboot would only interrupt the VoWiFi that is working.
+MM_RESETTABLE_FAILURES = {"unknown-capabilities", "unknown"}
+MM_FAILED_GRACE_SECONDS = 60.0
+MM_RESET_BACKOFF_SECONDS = 300.0
+MM_RESET_ATTEMPTS = 3
 # Grace between publishing "launching" and expecting systemd to report the updater unit as
 # active, so a loop pass that races a launch cannot retire the run it just started.
 UPDATE_LAUNCH_GRACE_SECONDS = 90.0
@@ -531,6 +559,9 @@ class Orchestrator:
         self.device_status_path = self.root / "devices-status.json"
         self.bridge_restart_request_dir = self.root / "bridge-restart-requests"
         self.bridge_restart_status_dir = self.root / "bridge-restart-status"
+        # USB devices that look like a modem but match no model, and operator-requested tests.
+        self.usb_candidates = modem_probe.CandidateScanner(self.root / "usb-candidates.json")
+        self.modem_probes = modem_probe.ProbeRequests(self.root)
         self.generated = self.root / "sing-box.json"
         self.xray_generated = self.root / "xray.json"
         self.cache = self.root / "subscription.yaml"
@@ -551,6 +582,8 @@ class Orchestrator:
         # When sing-box last (re)started; measurements before it settles are cold-start
         # numbers, not node quality.
         self.singbox_started_at = 0.0
+        # Country tuns whose systemd-resolved registration has not been undone yet.
+        self.tun_dns_pending: set[str] = set()
         self.exit_node_history = self.root / "exit-node-history.jsonl"
         self.reselect_path = self.root / "exit-reselect.json"
         self.reselect_handled_path = self.root / "exit-reselect-handled.json"
@@ -648,6 +681,9 @@ class Orchestrator:
         # status document reported every freshly respawned process as a running bridge.
         self._bridge_started: dict[str, float] = {}
         self._bridge_failures: dict[str, dict] = {}
+        # device id -> ModemManager's "failed" verdict on it: reason, since when, and the
+        # module reboots tried. Cleared once ModemManager reports any other state.
+        self._modem_failed: dict[str, dict] = {}
         # Whether this gateway is configured VoWiFi-only (hardware.modem_backend = serial).
         self._serial_mode = False
         # device id -> the exact command its bridge runs, for the support bundle.
@@ -1052,7 +1088,10 @@ class Orchestrator:
             # refused read as an indefinite spinner with no explanation; the reason belongs
             # in the error field instead.
             degraded = self._degraded.get(device_id, "")
-            device_transitioning = bool(transitioning or (not degraded and
+            # A modem ModemManager has failed is a settled outcome as well: its reason is in
+            # the cellular state, and VoWiFi carries on through the bridge.
+            modem_failed = device_id in self._modem_failed
+            device_transitioning = bool(transitioning or (not degraded and not modem_failed and
                 present and (target_data_active != observed_data_active or
                              (backend_active and radio_enabled is not None and
                               bool(wanted.get("flight_mode")) == radio_enabled) or
@@ -1140,15 +1179,7 @@ class Orchestrator:
             if not Path(port).exists():
                 continue
             try:
-                modem = serial.Serial(port, 115200, timeout=.5, write_timeout=2,
-                                      exclusive=True)
-                try:
-                    modem.reset_input_buffer()
-                    modem.write(b"AT+CFUN=1,1\r")
-                    modem.flush()
-                    time.sleep(1)
-                finally:
-                    modem.close()
+                self.reboot_modem(port)
                 reset += 1
             except Exception as exc:
                 errors.append(f"{port}: {exc}")
@@ -1157,6 +1188,73 @@ class Orchestrator:
         if reset:
             # USB serial ports disappear and return after the module reboot.
             time.sleep(12)
+
+    @staticmethod
+    def reboot_modem(port: str) -> None:
+        """Reboot the module behind an AT port (AT+CFUN=1,1). Its USB ports disappear and
+        come back; the caller waits for them."""
+        modem = serial.Serial(port, 115200, timeout=.5, write_timeout=2, exclusive=True)
+        try:
+            modem.reset_input_buffer()
+            modem.write(b"AT+CFUN=1,1\r")
+            modem.flush()
+            time.sleep(1)
+        finally:
+            modem.close()
+
+    def recover_failed_modem(self, modem: dict, reason: str, wanted: bool = True) -> None:
+        """ModemManager gave up on this modem. Reboot the module when that can help, spaced
+        out and at most MM_RESET_ATTEMPTS times; ModemManager probes it afresh when its ports
+        return. Retrying --enable, as before, only repeated "Wrong state" every cycle.
+
+        ``wanted`` is False in flight mode: the failure is recorded but nothing is rebooted.
+        Times are monotonic, so the clock being set at boot neither skips the grace period
+        nor stretches the backoff."""
+        device_id = modem["id"]
+        now = time.monotonic()
+        record = self._modem_failed.setdefault(
+            device_id, {"reason": reason, "since": now, "resets": 0, "rebooted": 0,
+                        "last_reset": None})
+        record["reason"] = reason
+        if not wanted or reason not in MM_RESETTABLE_FAILURES or \
+                record["resets"] >= MM_RESET_ATTEMPTS:
+            return
+        if now - record["since"] < MM_FAILED_GRACE_SECONDS:
+            return
+        if record["last_reset"] is not None and \
+                now - record["last_reset"] < MM_RESET_BACKOFF_SECONDS * (2 ** (record["resets"] - 1)):
+            return
+        if serial is None or self.dry_run:
+            return
+        record["resets"] += 1
+        record["last_reset"] = now
+        self.log(f"ModemManager failed {device_id} ({reason}); rebooting the module "
+                 f"(attempt {record['resets']} of {MM_RESET_ATTEMPTS})")
+        try:
+            self.reboot_modem(modem["tty"])
+            record["rebooted"] += 1
+        except Exception as exc:
+            self.log(f"could not reboot {device_id}: {exc}")
+
+    def forget_absent_modem_failures(self, live_ids: set) -> None:
+        """A module this loop just rebooted is briefly absent; keeping its record is what
+        bounds the reboots. Anything else absent was unplugged, which starts afresh."""
+        now = time.monotonic()
+        self._modem_failed = {device_id: value for device_id, value
+                              in self._modem_failed.items()
+                              if device_id in live_ids or
+                              (value["last_reset"] is not None and
+                               now - value["last_reset"] < MM_RESET_BACKOFF_SECONDS)}
+
+    def modem_failure(self, device_id: str) -> dict:
+        """What the control plane shows for a failed modem; {} when it is not failed."""
+        record = self._modem_failed.get(device_id)
+        if not record:
+            return {}
+        resettable = record["reason"] in MM_RESETTABLE_FAILURES
+        return {"reason": record["reason"], "resettable": resettable,
+                "resets": record["resets"], "rebooted": record["rebooted"],
+                "exhausted": resettable and record["resets"] >= MM_RESET_ATTEMPTS}
 
     def _bridge_stderr_path(self, hwid: str):
         # Since 1.3.10 this carries the bridge's stdout too: its activity lines used to go
@@ -1388,8 +1486,10 @@ class Orchestrator:
                 "metadata_age_seconds": max(0, now - updated_at) if updated_at else None,
                 "imei_valid": len(imei) == 15,
                 "iccid_valid": iccid.startswith("89") and 19 <= len(iccid) <= 22,
-                "channels_ready": (metadata.get("channel_status") == "ready"
-                                   and requested > 0 and allocated == requested),
+                # Every requested slot is served, on its own channel or a shared one.
+                "channels_ready": (metadata.get("channel_status") == "ready" and requested > 0
+                                   and allocated > 0 and nonnegative_int(
+                                       metadata.get("slots_served", allocated)) == requested),
             }
 
         atomic_json(self.host_diagnostics_path, {
@@ -1494,6 +1594,10 @@ class Orchestrator:
         text = detail.stdout or ""
         power = self._kv(text, "modem.generic.power-state").lower()
         state = self._kv(text, "modem.generic.state").lower()
+        failed_reason = (self._kv(text, "modem.generic.state-failed-reason").lower()
+                         if state == "failed" else "")
+        if failed_reason in {"--", "none"}:
+            failed_reason = "unknown"
         primary = self._kv(text, "modem.generic.primary-port")
         ports = re.findall(r"modem\.generic\.ports\.value\[\d+\]\s*:\s*([^ ]+) \(([^)]+)\)", text)
         network_port = next((name for name, kind in ports if kind == "net"), "")
@@ -1523,7 +1627,7 @@ class Orchestrator:
         snapshot = {
             "available": True, "mm_object": obj, "powered": power == "on",
             "radio_enabled": radio_enabled,
-            "state": state, "registration": registration,
+            "state": state, "failed_reason": failed_reason, "registration": registration,
             "operator": operator,
             "signal": int(signal) if signal.isdigit() else None,
             "primary_port": primary, "network_interface": network_port,
@@ -1602,7 +1706,10 @@ class Orchestrator:
         if registration not in {"home", "roaming", "registered"}:
             return
         device_id = modem["id"]
-        if time.monotonic() - self.data_attempt_at.get(device_id, 0) < 45:
+        # `None` means "never attempted"; a 0 default would compare against a monotonic clock
+        # that starts near zero at boot and hold back the first dial for 45 seconds of uptime.
+        last_attempt = self.data_attempt_at.get(device_id)
+        if last_attempt is not None and time.monotonic() - last_attempt < 45:
             return
         self.data_attempt_at[device_id] = time.monotonic()
         primary = snapshot.get("primary_port") or snapshot.get("network_interface")
@@ -1878,6 +1985,15 @@ class Orchestrator:
                 if not obj:
                     continue
                 snapshot = self.modem_snapshot(modem)
+                if snapshot.get("state") == "failed":
+                    # Enabling a failed modem only ever answers "Wrong state". Report it
+                    # and recover instead; VoWiFi does not depend on it.
+                    self.recover_failed_modem(modem, snapshot.get("failed_reason") or "unknown",
+                                              wanted=radio_enabled)
+                    snapshot["failure"] = self.modem_failure(device_id)
+                    self.cellular_states[device_id] = snapshot
+                    continue
+                self._modem_failed.pop(device_id, None)
                 observed = snapshot.get("radio_enabled") if snapshot.get("available") else None
                 if observed == radio_enabled:
                     self.radio_states[device_id] = radio_enabled
@@ -1931,7 +2047,7 @@ class Orchestrator:
     def reconcile_timezone(self):
         """Apply the validated WebUI timezone to the host without changing its hostname."""
         try:
-            document = yaml.safe_load((self.data / "config.yaml").read_text()) or {}
+            document = load_yaml_text((self.data / "config.yaml").read_text())
             timezone = str((document.get("settings") or {}).get("timezone") or "").strip()
         except Exception:
             return
@@ -1974,7 +2090,18 @@ class Orchestrator:
                     raise
         if yaml is None:
             raise RuntimeError("PyYAML is required for subscription mode")
-        return yaml.safe_load(cache.read_text(encoding="utf-8")) or {}
+        # The cache only changes on a refresh (every refresh_minutes), but this runs on every
+        # reconcile pass. Keep the parsed document until the file changes; hand out a copy so
+        # the proxy builders can never edit the cached one.
+        stat = cache.stat()
+        key = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        parsed = getattr(self, "_subscription_docs", None)
+        if parsed is None:
+            parsed = self._subscription_docs = {}
+        entry = parsed.get(str(cache))
+        if entry is None or entry[0] != key:
+            entry = parsed[str(cache)] = (key, load_yaml_text(cache.read_text(encoding="utf-8")))
+        return deepcopy(entry[1])
 
     def xray_bridge_outbound(self, node: dict, sing_tag: str, runtime_id: str) -> dict:
         """Register one loopback-only Xray endpoint and return its sing-box detour."""
@@ -2544,6 +2671,11 @@ class Orchestrator:
             except subprocess.TimeoutExpired: old.kill(); old.wait()
         os.replace(candidate, self.generated)
         self.singbox = subprocess.Popen([binary, "run", "-c", str(self.generated)])
+        # The restore path below relaunches the previous config, whose tuns register the same
+        # way; the union covers whichever of the two ends up running.
+        self.tun_dns_pending |= {str(item.get("interface_name"))
+                                 for item in config.get("inbounds") or []
+                                 if item.get("type") == "tun" and item.get("interface_name")}
         time.sleep(0.8)
         if self.singbox.poll() is not None:
             # Restore and restart the last checked/running config. Routes are kept only after
@@ -2556,6 +2688,36 @@ class Orchestrator:
             raise RuntimeError("sing-box exited during startup")
         self.last_proxy_fingerprint = fingerprint
         self.last_proxy_config = deepcopy(config)
+
+    def release_tun_dns(self):
+        """Take the country tuns back out of the host's DNS.
+
+        sing-tun runs ``resolvectl domain <tun> ~.``, ``default-route <tun> true`` and
+        ``dns <tun> <address+1>`` on every tun it brings up, whether or not auto_route is set,
+        and sing-box exposes no option to stop it. On a host resolving through
+        systemd-resolved (Ubuntu desktop and server) that makes the tun the resolver for every
+        name, and nothing answers there: the exits only carry routed ePDG addresses, so the
+        whole host lost DNS the moment an exit was enabled (Discussion #104). Hosts without
+        resolvectl, such as Raspberry Pi OS, never received the registration.
+
+        The registration is made once, asynchronously, shortly after start, so it is looked
+        for on each pass for a bounded time and reverted as soon as it appears.
+        """
+        if self.dry_run or not self.tun_dns_pending:
+            return
+        ctl = shutil.which("resolvectl")
+        if not ctl:
+            self.tun_dns_pending.clear()
+            return
+        for iface in sorted(self.tun_dns_pending):
+            shown = run([ctl, "domain", iface])
+            if shown.returncode == 0 and "~." in shown.stdout.split():
+                run([ctl, "revert", iface])
+                self.tun_dns_pending.discard(iface)
+                self.log(f"removed {iface} from the host DNS configuration "
+                         "(sing-box registers every tun as the catch-all resolver)")
+        if time.time() - self.singbox_started_at > TUN_DNS_WATCH_SECONDS:
+            self.tun_dns_pending.clear()
 
     def apply_xray(self, config: dict | None):
         if not config:
@@ -2678,7 +2840,10 @@ class Orchestrator:
                             exits_state[country] = {**exits_state[country], "ready": False,
                                                     "error": f"Xray is unavailable: {exc}"}
                     self.log(f"Xray failed; {len(self._xray_countries)} exit(s) affected: {exc}")
-                self.apply_singbox(config)
+                try:
+                    self.apply_singbox(config)
+                finally:
+                    self.release_tun_dns()
             else:
                 self.apply_xray(None)
             # Ranking must come first: update_selected_nodes then reports the node this cycle
@@ -2927,6 +3092,21 @@ class Orchestrator:
                  "it collides with this gateway's per-modem virtual readers")
         return True
 
+    @staticmethod
+    def reader_config_unreadable(config_path: Path) -> bool:
+        """Whether an unprivileged pcscd would be unable to read the reader definitions.
+
+        This service runs with UMask=0077, so a freshly created definition file is 0600
+        root. pcscd running as root never noticed; distributions whose pcscd.service drops
+        to its own user (Ubuntu 26.04) silently skip the file and no modem reader appears.
+        Files written by earlier releases keep that mode, and their content already matches,
+        so the mode has to be checked on its own for an upgrade to repair them.
+        """
+        try:
+            return (config_path.stat().st_mode & 0o044) != 0o044
+        except OSError:
+            return False
+
     def reconcile_hardware(self, desired: dict, desired_devices: dict,
                            through_modemmanager=False) -> dict:
         hardware = (desired.get("hardware") or {})
@@ -2946,6 +3126,7 @@ class Orchestrator:
                           if device_id in live_ids}
         self._bridge_failures = {device_id: value for device_id, value
                                  in self._bridge_failures.items() if device_id in live_ids}
+        self.forget_absent_modem_failures(live_ids)
         old = read_json(self.hw_state_path).get("assignments") or {}
         ports = [BASE_VPCD_PORT + i * VPCD_PORT_STRIDE for i in range(VPCD_PORT_SLOTS)]
         # A port saved by a release that started at vpcd's own default is migrated here:
@@ -2980,10 +3161,12 @@ class Orchestrator:
         legacy_config = config_path.with_name("vowifi-modems")
         legacy_present = legacy_config.exists() and legacy_config != config_path
         distro_disabled = self.disable_distro_vpcd_reader(config_path)
-        if reader_config != self.last_reader_config or distro_disabled:
+        unreadable = self.reader_config_unreadable(config_path)
+        if reader_config != self.last_reader_config or distro_disabled or unreadable:
             if not self.dry_run:
                 config_path.parent.mkdir(parents=True, exist_ok=True)
                 config_path.write_text(reader_config, encoding="utf-8")
+                os.chmod(config_path, 0o644)
                 if legacy_present:
                     legacy_config.unlink(missing_ok=True)
                 (self.root / "pcsc-maintenance").write_text(str(int(time.time())), encoding="ascii")
@@ -3094,11 +3277,12 @@ class Orchestrator:
             # hardware lives beside proxy in settings; desired v1 publishers may omit it.
             if not desired.get("hardware"):
                 try:
-                    conf = yaml.safe_load((self.data / "config.yaml").read_text()) or {}
+                    conf = load_yaml_text((self.data / "config.yaml").read_text())
                     desired["hardware"] = (conf.get("settings") or {}).get("hardware") or {}
                 except Exception:
                     pass
             discovered = self.usb_modems(desired.get("hardware") or {})
+            self.reconcile_usb_candidates(desired.get("hardware") or {})
             self.migrate_device_ids(discovered)
             desired_devices, _migrated = self.desired_devices(discovered)
             present_ids = {modem["id"] for modem in discovered}
@@ -3180,12 +3364,28 @@ class Orchestrator:
             self._last_conclusion = fingerprint
             self._sleep_for_work(IDLE_INTERVAL_SECONDS if idle else self.interval)
 
+    def reconcile_usb_candidates(self, hardware: dict):
+        """Publish unrecognised modem-like USB devices and run any test the operator asked for.
+
+        Tests run here, before bridges are reconciled, and only on request: sending AT to a
+        serial port nobody identified is never done on the gateway's own initiative.
+        """
+        if self.dry_run:
+            return
+        known = {(str(p.get("vid", "")).lower(), str(p.get("pid", "")).lower())
+                 for p in hardware.get("modem_profiles") or [] if isinstance(p, dict)}
+        try:
+            candidates = self.usb_candidates.scan(known, run)
+            self.modem_probes.process(candidates, log=self.log)
+        except Exception as exc:  # never let discovery of extras stop the known modems
+            self.log(f"USB candidate scan failed: {exc}")
+
     def _input_mtimes(self) -> tuple:
         """Cheap change detector for the documents an operator action writes."""
         stamps = []
         for path in (self.desired_path, self.device_desired_path,
                      self.data / "config.yaml", self.reselect_path,
-                     self.bridge_restart_request_dir):
+                     self.bridge_restart_request_dir, self.modem_probes.request_dir):
             try:
                 stamps.append(path.stat().st_mtime)
             except OSError:
